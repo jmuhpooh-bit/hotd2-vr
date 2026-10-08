@@ -166,7 +166,7 @@ hotd2-vr\build-quest.cmd
 ```
 
 This builds the `vr` build type (arm64, optimised, OpenXR) to
-`shell\android-studio\flycast\build\intermediates\apk\vr\flycast-vr.apk`. It installs
+`shell\android-studio\flycast\build\outputs\apk\vr\flycast-vr.apk`. It installs
 as its own app, *HOTD2 VR* (`com.flycast.emulator.vr`), next to a normal Flycast.
 
 `hotd2-vr\build-win.cmd` builds the Windows version (Visual Studio 2022 Build Tools) with

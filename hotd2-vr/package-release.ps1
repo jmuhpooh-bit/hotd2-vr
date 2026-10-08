@@ -25,7 +25,7 @@ if (-not $SkipBuild) {
 New-Item -ItemType Directory -Force $dist | Out-Null
 
 # the Quest app
-$apk = Join-Path $repo 'shell\android-studio\flycast\build\intermediates\apk\vr\flycast-vr.apk'
+$apk = Join-Path $repo 'shell\android-studio\flycast\build\outputs\apk\vr\flycast-vr.apk'
 Copy-Item $apk (Join-Path $dist 'hotd2-vr-quest.apk') -Force
 
 # the PC version: VR on, OpenGL (the only renderer VR draws with)

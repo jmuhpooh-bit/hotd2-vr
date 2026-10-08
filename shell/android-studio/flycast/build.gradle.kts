@@ -74,6 +74,12 @@ android {
                     arguments += "-DUSE_OPENXR=ON"
                 }
             }
+            // The Quest is arm64. (Not with -Pandroid.injected.build.abi: that's the IDE's
+            // build for one device, and it marks the APK test-only, which SideQuest and a
+            // plain adb install refuse.)
+            ndk {
+                abiFilters += "arm64-v8a"
+            }
             applicationIdSuffix = ".vr"
             versionNameSuffix = "-vr"
         }

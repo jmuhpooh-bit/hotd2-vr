@@ -8,6 +8,6 @@ for /d %%J in ("%ProgramFiles%\Microsoft\jdk-17*") do set "JAVA_HOME=%%J"
 if not defined ANDROID_HOME set "ANDROID_HOME=%LOCALAPPDATA%\Android\Sdk"
 cd /d "%~dp0..\shell\android-studio" || exit /b 1
 rem Full path: a bare gradlew.bat isn't found when NoDefaultCurrentDirectoryInExePath is set.
-call "%CD%\gradlew.bat" assembleVr -Pandroid.injected.build.abi=arm64-v8a --console=plain %* || exit /b 1
+call "%CD%\gradlew.bat" assembleVr --console=plain %* || exit /b 1
 echo.
-echo Built: %~dp0..\shell\android-studio\flycast\build\intermediates\apk\vr\flycast-vr.apk
+echo Built: %~dp0..\shell\android-studio\flycast\build\outputs\apk\vr\flycast-vr.apk
