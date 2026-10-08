@@ -503,7 +503,9 @@ bool init()
 		ERROR_LOG(RENDERER, "XR: no current EGL context");
 		return false;
 	}
-	const EGLint configAttribs[] { EGL_CONFIG_ID, configId, EGL_NONE };
+	// eglChooseConfig defaults to window surfaces. Match the current context
+	// by ID even when its config supports only our offscreen pbuffer.
+	const EGLint configAttribs[] { EGL_CONFIG_ID, configId, EGL_SURFACE_TYPE, 0, EGL_NONE };
 	if (!eglChooseConfig(display, configAttribs, &eglConfig, 1, &configCount) || configCount == 0)
 	{
 		ERROR_LOG(RENDERER, "XR: EGL config not found");
