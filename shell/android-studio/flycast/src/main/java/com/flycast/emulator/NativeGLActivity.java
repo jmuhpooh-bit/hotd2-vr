@@ -1,6 +1,7 @@
 package com.flycast.emulator;
 
 import android.content.Context;
+import android.content.Intent;
 import android.os.Bundle;
 import android.text.InputType;
 import android.util.Log;
@@ -43,6 +44,19 @@ public final class NativeGLActivity extends BaseGLActivity {
 
         setContentView(mLayout);
         Log.i("flycast", "NativeGLActivity.onCreate done");
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // A Quest library launch resumes the existing game. Do not initialize
+        // the native singleton or load the same disc for a second Activity.
+        if (Intent.ACTION_VIEW.equals(intent.getAction()) && intent.getData() != null) {
+            com.flycast.emulator.emu.JNIdc.setGameUri(intent.getData().toString());
+            intent.setData(null);
+        }
+        Log.i("flycast", "NativeGLActivity.onNewIntent: reusing the existing game");
     }
 
     @Override

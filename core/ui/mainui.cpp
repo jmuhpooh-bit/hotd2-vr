@@ -31,9 +31,10 @@
 #include "oslib/i18n.h"
 
 #include <chrono>
+#include <atomic>
 #include <thread>
 
-static bool mainui_enabled;
+static std::atomic<bool> mainui_enabled;
 u32 MainFrameCount;
 static bool forceReinit;
 
@@ -60,6 +61,11 @@ bool mainui_rend_frame()
 	else
 	{
 		try {
+			// Android pauses the game when the Quest system menu takes focus.
+			// Keep polling and submitting OpenXR frames while that game is paused,
+			// so STOPPING/READY events and a return to the headset can complete.
+			if (vr::xr::enabled() && !emu.running())
+				return vr::xr::frame();
 			if (!emu.render())
 				return false;
 			if (config::ProfilerEnabled && config::ProfilerDrawToGUI)

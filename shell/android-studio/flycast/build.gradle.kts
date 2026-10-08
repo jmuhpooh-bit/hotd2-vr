@@ -22,7 +22,7 @@ android {
         applicationId = "com.flycast.emulator"
         minSdk = 29     // hotd2-vr: Quest only (the OpenXR loader needs 24+)
         targetSdk = 36
-        versionCode = 8
+        versionCode = 9
         versionName = gitVersionName()
         vectorDrawables.useSupportLibrary = true
 

@@ -34,6 +34,12 @@
         <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|questpro|quest3|quest3s" />
         <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
 
+        <!-- Reopening from the Quest library must not create another owner of the
+             process-wide emulator, render thread and OpenXR session. -->
+        <activity
+            android:name="com.flycast.emulator.NativeGLActivity"
+            android:launchMode="singleTask" />
+
         <!-- launch in VR; also openable with a game file, as the regular app -->
         <activity-alias
             android:name="com.flycast.emulator.MainActivity"

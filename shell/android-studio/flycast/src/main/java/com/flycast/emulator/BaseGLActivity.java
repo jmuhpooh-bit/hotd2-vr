@@ -310,6 +310,13 @@ public abstract class BaseGLActivity extends Activity implements ActivityCompat.
     }
 
     private boolean showMenu() {
+        if (getPackageName().endsWith(".vr")) {
+            // Flycast's settings are a flat Android window, not an OpenXR layer.
+            // Opening them stops headset frames and leaves the player in black.
+            // In-game pause is A; the Quest system menu belongs to the runtime.
+            Log.i("flycast", "Ignoring flat Flycast menu in the VR build");
+            return true;
+        }
         JNIdc.guiOpenSettings();
         return true;
     }

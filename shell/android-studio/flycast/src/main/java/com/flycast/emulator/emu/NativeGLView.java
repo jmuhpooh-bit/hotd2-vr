@@ -119,10 +119,12 @@ public class NativeGLView extends SurfaceView implements SurfaceHolder.Callback 
     public void surfaceDestroyed(SurfaceHolder surfaceHolder) {
         Log.i("flycast", "NativeGLView.surfaceDestroyed");
         surfaceReady = false;
-        JNIdc.rendinitNative(null, 0, 0);
         BaseGLActivity activity = Emulator.getCurrentActivity();
         if (activity != null)
             activity.handleStateChange(true);
+        // Stop the producer while its render consumer still exists, then release
+        // the GL/OpenXR context. The old order could strand an emulation frame.
+        JNIdc.rendinitNative(null, 0, 0);
     }
 
     public boolean isSurfaceReady() {
