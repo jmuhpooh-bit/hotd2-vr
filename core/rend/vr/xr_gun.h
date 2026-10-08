@@ -66,6 +66,7 @@ struct GunView
 	bool aimDot = false;		// draw the dot at the aim point
 	bool aimOutside = false;	// ...greyed: the game can't hit there (outside its own view)
 	glm::vec3 aimPoint { 0.f };	// room space
+	int player = 0;				// whose gun: player 1's aim is red, player 2's blue
 	// The game's pistol only (gameGun()):
 	float slide = 0.f;			// metres its slide is back, in model space
 	bool otherHand = false;		// the open hand on the other controller, or racking the slide...
@@ -76,9 +77,13 @@ struct GunView
 // bounce forward, settled after about a quarter second. 0..1, can go slightly negative.
 float gunKick(float sinceShot);
 
-// Draws the gun into the bound eye framebuffer, on top of the game image.
+// Draws the gun into the bound eye framebuffer, on top of the game image, in two passes:
+// first every gun's model (the first clears the depth: the guns are in front of the game),
+// then every gun's glow (aim line and dot, flash; the smoke of all guns with the first), so
+// one gun's model never covers the other's dot or flash.
 // viewProj: room space -> this eye's clip space; eyePos: the eye, in room space.
-void drawGun(const glm::mat4& viewProj, const glm::vec3& eyePos, const GunView& gun);
+void drawGunModel(const glm::mat4& viewProj, const glm::vec3& eyePos, const GunView& gun, bool clearDepth);
+void drawGunGlow(const glm::mat4& viewProj, const glm::vec3& eyePos, const GunView& gun, bool withSmoke);
 // The GL context is going away.
 void termGun();
 

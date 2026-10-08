@@ -32,6 +32,9 @@ public final class NativeGLActivity extends BaseGLActivity {
         requestWindowFeature(Window.FEATURE_NO_TITLE);
 
         super.onCreate(savedInstanceState);
+        // hotd2-vr: on its way to the setup panel
+        if (isFinishing())
+            return;
 
         // Create the actual GL view
         mView = new NativeGLView(this);

@@ -14,6 +14,10 @@ target_sources(${PROJECT_NAME} PRIVATE
         transform_matrix.h
         vr_reproject.cpp
         vr_reproject.h
+        vr/hands_build.cpp
+        vr/hands_build.h
+        vr/hands_rip.cpp
+        vr/hands_rip.h
         norend/norend.cpp)
 
 if(USE_OPENGL)

@@ -5,6 +5,7 @@
 */
 #include "vr_reproject.h"
 #include "vr/xr_host.h"
+#include "vr/hands_rip.h"
 #include "transform_matrix.h"
 #include "hw/pvr/ta_ctx.h"
 #include "hw/pvr/pvr_mem.h"
@@ -187,21 +188,43 @@ struct GameProfile
 	u16 fovStock;
 	// The textures of the game's own hit marker (VRAM addresses): see dropShotMarker.
 	u32 markerTextures[4];
+	// Player 2's "PRESS START BUTTON" and "CREDIT(S)" pictures: see hidePlayer2Prompt.
+	u32 p2PromptTextures[4];
+	// The agent's parts in the game over scene (hands_rip.h).
+	hands::Parts hands;
 };
 static const GameProfile profiles[] = {
 	// The House of the Dead 2 (PAL). Its four perspective setups (0x8C029B48, 0x8C02B2C6,
 	// 0x8C02B30A, 0x8C02B34E) load 41.1 degrees from two literals and call 0x8C0383C0.
 	// Its hit marker: a glow (0x59bb80, ~62 px) on the shot and rays (0x587380) flying out
 	// ~100 px, drawn at W 0.9..1.01 (measured on the PC, chapter 1 and the attract demo).
-	{ "MK-5100250", 0x4C65E0, 0x4C6708, 2.f, { 0x029C12, 0x02B370 }, 7484, { 0x59bb80, 0x587380 } },
+	// Player 2's prompt in the bottom right corner: 0x57b700 and 0x56bb00 (chapter 1).
+	{ "MK-5100250", 0x4C65E0, 0x4C6708, 2.f, { 0x029C12, 0x02B370 }, 7484, { 0x59bb80, 0x587380 }, { 0x57b700, 0x56bb00 },
+			{ { 0x5fa380, 0x5fc380 }, 0x601380, 0x5fe380 } },
+	// The House of the Dead 2 (USA): the same code and data as PAL, elsewhere (found by
+	// comparing RAM and VRAM dumps of both at the same moments: code 0x280 lower, the matrices
+	// 0x680 lower, the setups at 0x8C0298C4, 0x8C02B042, 0x8C02B086 and 0x8C02B0CA calling
+	// perspective() at 0x8C038140; every texture an exact byte match of PAL's).
+	{ "MK-51002", 0x4C5F60, 0x4C6088, 2.f, { 0x02998E, 0x02B0EC }, 7484, { 0x59e000, 0x589000 }, { 0x53c400, 0x572000 },
+			{ { 0x5fc800, 0x5fe800 }, 0x603800, 0x600800 } },
 };
 
+const hands::Parts *gameHandsParts()
+{
+	for (const GameProfile& prof : profiles)
+		if (settings.content.gameId == prof.gameId && prof.hands.gun != 0)
+			return &prof.hands;
+	return nullptr;
+}
+
 static u32 markerTextures[4];	// the active profile's GameProfile::markerTextures
+static u32 p2PromptTextures[4];	// ...and GameProfile::p2PromptTextures
 
 static void applyGameProfile(Event, void *)
 {
 	std::fill(std::begin(fovLiterals), std::end(fovLiterals), 0u);
 	std::fill(std::begin(markerTextures), std::end(markerTextures), 0u);
+	std::fill(std::begin(p2PromptTextures), std::end(p2PromptTextures), 0u);
 	if (xr::enabled())
 	{
 		// Everything the headset view depends on.
@@ -224,15 +247,21 @@ static void applyGameProfile(Event, void *)
 			fovStock = prof.fovStock;
 		}
 		std::copy(std::begin(prof.markerTextures), std::end(prof.markerTextures), std::begin(markerTextures));
-		if (xr::enabled() && config::VrXrGun && config::MapleMainDevices[0] != MDT_LightGun)
+		std::copy(std::begin(prof.p2PromptTextures), std::end(prof.p2PromptTextures), std::begin(p2PromptTextures));
+		const bool gunB = config::VrDualWield;
+		if (xr::enabled() && config::VrXrGun
+				&& (config::MapleMainDevices[0] != MDT_LightGun || (gunB && config::MapleMainDevices[1] != MDT_LightGun)))
 		{
 			// The right controller is a light gun: plug one into port A (a pad ignores
-			// where it points). The devices were made just before this event, before the
-			// game runs, so they can still be swapped.
+			// where it points), and player 2's into port B for dual wielding (vr.DualWield).
+			// The devices were made just before this event, before the game runs, so they
+			// can still be swapped.
 			config::MapleMainDevices[0].override(MDT_LightGun);
+			if (gunB)
+				config::MapleMainDevices[1].override(MDT_LightGun);
 			mcfg_DestroyDevices();
 			mcfg_CreateDevices();
-			NOTICE_LOG(RENDERER, "VR: light gun in port A");
+			NOTICE_LOG(RENDERER, "VR: light gun in port A%s", config::VrDualWield ? " and B" : "");
 		}
 		NOTICE_LOG(RENDERER, "VR: camera profile for %s", prof.gameId);
 	}
@@ -398,6 +427,82 @@ static void hideLetterbox(rend_context& ctx, const std::vector<PolyParam>& list,
 		if (i == pp.first + pp.count)
 			hideVertices(ctx, pp);
 	}
+}
+
+// Player 2's "PRESS START BUTTON" with "CREDIT(S)" and its number under it, in the bottom
+// right corner all through a one-player game: in the headset it floats in the room for
+// nothing (asked for on Reddit, twice). Its pictures go when the game profile knows them
+// (vr.HideP2Prompt), and so does what's on the line right after them (the number). Player
+// 1's own, bottom left, stays, and so do the story's subtitles.
+static std::atomic<int64_t> p2PromptAt { -1000000 };
+
+static void hidePlayer2Prompt(rend_context& ctx, const RenderPass& pass, const RenderPass& prev, float hudW,
+		int fbWidth, int fbHeight)
+{
+	if (p2PromptTextures[0] == 0)
+		return;
+	const bool hide = config::VrHideP2Prompt;
+	struct Box { float x0, y0, x1, y1; };
+	auto flat = [&](const PolyParam& pp, Box& b) {
+		if (pp.count < 3 || pp.first + pp.count > ctx.verts.size())
+			return false;
+		b = { 1e9f, 1e9f, -1e9f, -1e9f };
+		for (u32 i = pp.first; i < pp.first + pp.count; i++)
+		{
+			const Vertex& v = ctx.verts[i];
+			if (!(v.z > 0.f) || std::abs(1.f / v.z - hudW) > 0.05f || !std::isfinite(v.x) || !std::isfinite(v.y))
+				return false;
+			b = { std::min(b.x0, v.x), std::min(b.y0, v.y), std::max(b.x1, v.x), std::max(b.y1, v.y) };
+		}
+		return true;
+	};
+	auto each = [&](auto&& fn) {
+		auto list = [&](const std::vector<PolyParam>& polys, u32 from, u32 to) {
+			for (u32 n = from; n < to && n < polys.size(); n++)
+				fn(polys[n]);
+		};
+		list(ctx.global_param_op, std::max(prev.op_count, 1u), pass.op_count);
+		list(ctx.global_param_pt, prev.pt_count, pass.pt_count);
+		list(ctx.global_param_tr, prev.tr_count, pass.tr_count);
+	};
+	Box gone[4];
+	int count = 0;
+	each([&](const PolyParam& pp) {
+		Box b;
+		const u32 tex = pp.pcw.Texture ? pp.tcw.TexAddr << 3 : 0;
+		if (tex == 0 || std::find(std::begin(p2PromptTextures), std::end(p2PromptTextures), tex) == std::end(p2PromptTextures)
+				|| !flat(pp, b) || b.x0 < fbWidth * 0.55f || b.y0 < fbHeight * 0.8f)
+			return;
+		if (hide)
+			hideVertices(ctx, pp);
+		if (count < (int)std::size(gone))
+			gone[count++] = b;
+	});
+	if (count == 0)
+		return;
+	// (seen: player 2 isn't playing, see xr_host.cpp's dual wielding)
+	p2PromptAt = steadyMs();
+	if (!hide)
+		return;
+	each([&](const PolyParam& pp) {
+		Box b;
+		if (!flat(pp, b))
+			return;
+		for (int k = 0; k < count; k++)
+			if (b.x0 >= gone[k].x0 && b.x1 <= gone[k].x1 + fbWidth * 0.12f && b.y0 >= gone[k].y0 - 4.f && b.y1 <= gone[k].y1 + 4.f)
+			{
+				hideVertices(ctx, pp);
+				break;
+			}
+	});
+}
+
+bool player2Prompting() {
+	return steadyMs() - p2PromptAt < 500;
+}
+
+bool player2PromptKnown() {
+	return p2PromptTextures[0] != 0;
 }
 
 // PC: overlay-like polygons the headset's vertex shader could bend (mixed overlay and 3D
@@ -651,6 +756,7 @@ void dropShotMarker(rend_context& ctx, const RenderPass& pass, const RenderPass&
 	const bool onPC = !xr::enabled();
 	if (onPC)
 		ripRequested(ctx, pass, previousPass);
+	hands::observePass(ctx, pass, previousPass);
 	const float hudW = config::VrHudW;
 	static u32 parses;
 	if (onPC && parses++ % 240 == 0)
@@ -669,6 +775,7 @@ void dropShotMarker(rend_context& ctx, const RenderPass& pass, const RenderPass&
 	snapNear2D(ctx, ctx.global_param_op, std::max(previousPass.op_count, 1u), pass.op_count, hudW, fbWidth, fbHeight);
 	snapNear2D(ctx, ctx.global_param_pt, previousPass.pt_count, pass.pt_count, hudW, fbWidth, fbHeight);
 	snapNear2D(ctx, ctx.global_param_tr, previousPass.tr_count, pass.tr_count, hudW, fbWidth, fbHeight);
+	hidePlayer2Prompt(ctx, pass, previousPass, hudW, fbWidth, fbHeight);
 
 	// the recent shots, in DC framebuffer pixels
 	struct Recent { glm::vec2 gun; int64_t since, at; bool into3D; };

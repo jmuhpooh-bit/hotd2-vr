@@ -92,7 +92,7 @@ option(USE_OPENMP "Use OpenMP if available" ON)
 option(USE_VULKAN "Build with Vulkan support" ON)
 set(MOLTENVK_DYLIB "" CACHE FILEPATH "Path to macOS MoltenVK dylib for macOS Vulkan builds")
 option(USE_DX9 "Build with Direct3D 9 support" ON)
-option(USE_OPENXR "Android: build as an immersive OpenXR headset app (hotd2-vr)" OFF)
+option(USE_OPENXR "Android: build as an immersive OpenXR headset app; Windows: PCVR (hotd2-vr)" OFF)
 option(USE_DX11 "Build with Direct3D 11 support" ON)
 option(LIBRETRO "Build libretro core" OFF)
 option(USE_OPENGL "Use OpenGL API" ON)
@@ -1280,7 +1280,8 @@ if(NOT LIBRETRO)
 			target_compile_definitions(${PROJECT_NAME} PRIVATE USE_OPENXR)
 			target_sources(${PROJECT_NAME} PRIVATE core/rend/vr/xr_host.cpp core/rend/vr/xr_host.h
 			core/rend/vr/xr_gun.cpp core/rend/vr/xr_gun.h core/rend/vr/gun_model.h
-			core/rend/vr/xr_hands.cpp core/rend/vr/xr_hands.h)
+			core/rend/vr/xr_hands.cpp core/rend/vr/xr_hands.h
+			core/rend/vr/xr_panel.cpp core/rend/vr/xr_panel.h)
 		endif()
 
 	elseif(APPLE)
@@ -1453,6 +1454,28 @@ if(NOT LIBRETRO)
 			core/windows/rawinput.h)
 		if(NOT BUILD_TESTING)
 			target_sources(${PROJECT_NAME} PRIVATE core/windows/winmain.cpp)
+		endif()
+		# hotd2-vr: PCVR through OpenXR (SteamVR, Quest Link, Virtual Desktop): the Khronos
+		# loader, built into the program
+		if(USE_OPENXR AND NOT WINDOWS_STORE)
+			include(FetchContent)
+			FetchContent_Declare(openxr_sdk
+				URL https://github.com/KhronosGroup/OpenXR-SDK/archive/refs/tags/release-1.1.43.tar.gz
+				URL_HASH SHA256=fd0834e4bc75c935248d82ac044f472ab3af4d8ff3b191a3ccace3436975a4cf
+				DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+			set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+			set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
+			set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+			set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
+			# (its include(CTest) would switch on the building of Flycast's own tests)
+			set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+			FetchContent_MakeAvailable(openxr_sdk)
+			target_link_libraries(${PROJECT_NAME} PRIVATE OpenXR::openxr_loader opengl32)
+			target_compile_definitions(${PROJECT_NAME} PRIVATE USE_OPENXR)
+			target_sources(${PROJECT_NAME} PRIVATE core/rend/vr/xr_host.cpp core/rend/vr/xr_host.h
+				core/rend/vr/xr_gun.cpp core/rend/vr/xr_gun.h core/rend/vr/gun_model.h
+				core/rend/vr/xr_hands.cpp core/rend/vr/xr_hands.h
+				core/rend/vr/xr_panel.cpp core/rend/vr/xr_panel.h)
 		endif()
 		if(WINDOWS_STORE)
 			file(READ shell/uwp/Package.appxmanifest MANIFEST)

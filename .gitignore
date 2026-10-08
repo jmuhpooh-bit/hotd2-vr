@@ -23,6 +23,7 @@ CMakeUserPresets.json
 
 # hotd2-vr: Windows build, local tool data
 build-win/
+dist/
 hotd2-vr/fingergun/.venv/
 hotd2-vr/fingergun/settings.json
 hotd2-vr/fingergun/settings_2p_*.json

@@ -71,7 +71,7 @@ struct Puff
 	float size;
 };
 std::vector<Puff> smoke;
-unsigned lastShot;
+unsigned lastShot[2];		// per player
 
 // A cheap deterministic random number in 0..1 for shot n, stream k.
 float shotRandom(unsigned n, unsigned k)
@@ -333,39 +333,27 @@ float gunKick(float sinceShot)
 	return std::exp(-sinceShot / 0.06f) * std::cos(sinceShot * (6.2831853f / 0.22f));
 }
 
-void drawGun(const glm::mat4& viewProj, const glm::vec3& eyePos, const GunView& gun)
+// Where the muzzle is as drawn (with the recoil), which way it points, and how bright its
+// flash is now: full for two headset frames, then gone in another 50 ms.
+static void muzzleNow(const GunView& gun, glm::vec3& muzzle, glm::vec3& forward, float& flash)
 {
-	const bool game = gameGun();
-	if ((!game && !initModel()) || !initGlow())
-		return;
-
-	const glm::vec3 muzzle = glm::vec3(gun.pose * glm::vec4(gunMuzzle(), 1.f));
-	const glm::vec3 forward = glm::normalize(glm::vec3(gun.pose * glm::vec4(0.f, 0.f, -1.f, 0.f)));
-	// sizes that go with the model (flash, flame, smoke) follow its scale
-	const float g = gun.scale;
-	// Muzzle flash: full for two headset frames, then gone in another 50 ms.
-	const float flash = gun.sinceShot < 0.f ? 0.f
+	muzzle = glm::vec3(gun.pose * glm::vec4(gunMuzzle(), 1.f));
+	forward = glm::normalize(glm::vec3(gun.pose * glm::vec4(0.f, 0.f, -1.f, 0.f)));
+	flash = gun.sinceShot < 0.f ? 0.f
 			: gun.sinceShot < 0.02f ? 1.f
 			: std::max(0.f, 1.f - (gun.sinceShot - 0.02f) / 0.05f);
+}
 
-	// A new shot leaves smoke at the muzzle, drifting out of the barrel and upward.
-	if (gun.shot != lastShot)
-	{
-		lastShot = gun.shot;
-		// out of the barrel as it settles (the drawn gun is still kicked up now)
-		const glm::vec3 muzzle = gun.restMuzzle, forward = gun.restForward;
-		for (unsigned k = 0; gun.sinceShot < 0.1f && k < 3; k++)
-		{
-			const float spread = shotRandom(gun.shot, k) - 0.5f;
-			const glm::vec3 up(0.f, 1.f, 0.f);
-			smoke.push_back({ muzzle + forward * ((0.01f + 0.02f * k) * g),
-					forward * (0.18f + 0.1f * k) + up * (0.05f + 0.04f * spread) + glm::vec3(spread * 0.04f, 0.f, 0.f),
-					gun.now, (0.018f + 0.006f * k) * g });
-		}
-		if (smoke.size() > 36)
-			smoke.erase(smoke.begin(), smoke.begin() + (smoke.size() - 36));
-	}
-	smoke.erase(std::remove_if(smoke.begin(), smoke.end(), [&](const Puff& p) { return gun.now - p.born > 0.9; }), smoke.end());
+void drawGunModel(const glm::mat4& viewProj, const glm::vec3& eyePos, const GunView& gun, bool clearDepth)
+{
+	const bool game = gameGun();
+	if (!game && !initModel())
+		return;
+	glm::vec3 muzzle, forward;
+	float flash;
+	muzzleNow(gun, muzzle, forward, flash);
+	// sizes that go with the model (flash, flame, smoke) follow its scale
+	const float g = gun.scale;
 
 	// The gun is in the player's hand, in front of anything in the game: draw it over the
 	// image with its own depth test only.
@@ -376,8 +364,11 @@ void drawGun(const glm::mat4& viewProj, const glm::vec3& eyePos, const GunView& 
 	glcache.Enable(GL_DEPTH_TEST);
 	glcache.DepthMask(GL_TRUE);
 	glcache.DepthFunc(GL_LESS);
-	glClearDepthf(1.f);
-	glClear(GL_DEPTH_BUFFER_BIT);
+	if (clearDepth)
+	{
+		glClearDepthf(1.f);
+		glClear(GL_DEPTH_BUFFER_BIT);
+	}
 	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	GlVertexArray::unbind();
 
@@ -394,9 +385,40 @@ void drawGun(const glm::mat4& viewProj, const glm::vec3& eyePos, const GunView& 
 	}
 	else
 		drawModel(viewProj, eyePos, gun.pose, muzzleLight);
+}
 
-	// Glowing bits, in room space, on top. Smoke and the aim line are hidden by the gun
-	// where they pass behind it; the muzzle flash and the aim dot always show.
+void drawGunGlow(const glm::mat4& viewProj, const glm::vec3& eyePos, const GunView& gun, bool withSmoke)
+{
+	if (!initGlow())
+		return;
+	glm::vec3 muzzle, forward;
+	float flash;
+	muzzleNow(gun, muzzle, forward, flash);
+	const float g = gun.scale;
+
+	// A new shot leaves smoke at the muzzle, drifting out of the barrel and upward.
+	unsigned& shotWas = lastShot[gun.player & 1];
+	if (gun.shot != shotWas)
+	{
+		shotWas = gun.shot;
+		// out of the barrel as it settles (the drawn gun is still kicked up now)
+		const glm::vec3 muzzle = gun.restMuzzle, forward = gun.restForward;
+		for (unsigned k = 0; gun.sinceShot < 0.1f && k < 3; k++)
+		{
+			const float spread = shotRandom(gun.shot, k) - 0.5f;
+			const glm::vec3 up(0.f, 1.f, 0.f);
+			smoke.push_back({ muzzle + forward * ((0.01f + 0.02f * k) * g),
+					forward * (0.18f + 0.1f * k) + up * (0.05f + 0.04f * spread) + glm::vec3(spread * 0.04f, 0.f, 0.f),
+					gun.now, (0.018f + 0.006f * k) * g });
+		}
+		if (smoke.size() > 36)
+			smoke.erase(smoke.begin(), smoke.begin() + (smoke.size() - 36));
+	}
+	if (withSmoke)
+		smoke.erase(std::remove_if(smoke.begin(), smoke.end(), [&](const Puff& p) { return gun.now - p.born > 0.9; }), smoke.end());
+
+	// Glowing bits, in room space, on top. Smoke and the aim line are hidden by the guns
+	// where they pass behind them; the muzzle flash and the aim dot always show.
 	static std::vector<GlowVertex> line, smokeVerts, flames, stars, dots;
 	line.clear();
 	smokeVerts.clear();
@@ -413,7 +435,8 @@ void drawGun(const glm::mat4& viewProj, const glm::vec3& eyePos, const GunView& 
 			glm::vec3 side = glm::cross(fwd, eyePos - muzzle);
 			side = glm::length(side) < 1e-6f ? glm::vec3(0.0008f, 0, 0) : glm::normalize(side) * 0.0008f;
 			// fades out along the way: it guides without painting over the scene
-			const glm::vec4 start { 1.f, 0.08f, 0.05f, 0.55f }, end { 1.f, 0.08f, 0.05f, 0.f };
+			const glm::vec3 colour = gun.player == 1 ? glm::vec3(0.15f, 0.45f, 1.f) : glm::vec3(1.f, 0.08f, 0.05f);
+			const glm::vec4 start { colour, 0.55f }, end { colour, 0.f };
 			const glm::vec3 to = muzzle + fwd * std::min(len, 3.f);
 			const GlowVertex a { muzzle - side, start, {} }, b { muzzle + side, start, {} };
 			const GlowVertex c { to + side, end, {} }, d { to - side, end, {} };
@@ -421,15 +444,17 @@ void drawGun(const glm::mat4& viewProj, const glm::vec3& eyePos, const GunView& 
 				line.push_back(v);
 		}
 	}
-	for (const Puff& p : smoke)
-	{
-		const float age = (float)(gun.now - p.born);
-		const float t = age / 0.9f;
-		// slows down as it spreads; grows, then thins out
-		const glm::vec3 at = p.pos + p.vel * (0.35f * (1.f - std::exp(-age / 0.35f))) + glm::vec3(0.f, 0.03f * age, 0.f);
-		const float alpha = 0.22f * std::min(1.f, age / 0.06f) * (1.f - t) * (1.f - t);
-		billboard(smokeVerts, at, eyePos, p.size * (1.f + 3.5f * t), glm::vec4(0.62f, 0.6f, 0.58f, alpha));
-	}
+	// (the smoke of both guns, once)
+	if (withSmoke)
+		for (const Puff& p : smoke)
+		{
+			const float age = (float)(gun.now - p.born);
+			const float t = age / 0.9f;
+			// slows down as it spreads; grows, then thins out
+			const glm::vec3 at = p.pos + p.vel * (0.35f * (1.f - std::exp(-age / 0.35f))) + glm::vec3(0.f, 0.03f * age, 0.f);
+			const float alpha = 0.22f * std::min(1.f, age / 0.06f) * (1.f - t) * (1.f - t);
+			billboard(smokeVerts, at, eyePos, p.size * (1.f + 3.5f * t), glm::vec4(0.62f, 0.6f, 0.58f, alpha));
+		}
 	if (flash > 0.f)
 	{
 		// a tongue of fire out of the barrel, and a star burst with a white-hot core
@@ -450,18 +475,23 @@ void drawGun(const glm::mat4& viewProj, const glm::vec3& eyePos, const GunView& 
 			billboard(dots, gun.aimPoint, eyePos, size * 0.8f, glm::vec4(0.55f, 0.55f, 0.6f, 0.6f));
 		else
 		{
-			billboard(dots, gun.aimPoint, eyePos, size, glm::vec4(1.f, 0.12f, 0.06f, 0.95f));
-			billboard(dots, gun.aimPoint, eyePos, size * 0.4f, glm::vec4(1.f, 0.85f, 0.7f, 1.f));
+			const bool blue = gun.player == 1;
+			billboard(dots, gun.aimPoint, eyePos, size, blue ? glm::vec4(0.2f, 0.5f, 1.f, 0.95f) : glm::vec4(1.f, 0.12f, 0.06f, 0.95f));
+			billboard(dots, gun.aimPoint, eyePos, size * 0.4f, blue ? glm::vec4(0.75f, 0.9f, 1.f, 1.f) : glm::vec4(1.f, 0.85f, 0.7f, 1.f));
 		}
 	}
 
 	glcache.UseProgram(glowProgram);
 	glUniformMatrix4fv(gMvp, 1, GL_FALSE, &viewProj[0][0]);
 	glUniform1f(gStarAngle, 6.2831853f * shotRandom(gun.shot, 3));
+	GlVertexArray::unbind();
 	glEnableVertexAttribArray(VERTEX_POS_ARRAY);
 	glEnableVertexAttribArray(VERTEX_COL_BASE_ARRAY);
 	glEnableVertexAttribArray(VERTEX_UV_ARRAY);
 	glcache.Enable(GL_BLEND);
+	// smoke and the line against the guns' depth (the guns' models are all drawn by now)
+	glcache.Enable(GL_DEPTH_TEST);
+	glcache.DepthFunc(GL_LESS);
 	glcache.DepthMask(GL_FALSE);
 	// smoke: see-through grey
 	glcache.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -496,7 +526,7 @@ void termGun()
 	mMvp = mModel = mEye = mColor = mSpecular = mShininess = mEmissive = mLight = -1;
 	gMvp = gShape = gStarAngle = -1;
 	smoke.clear();
-	lastShot = 0;
+	lastShot[0] = lastShot[1] = 0;
 	termHands();
 }
 

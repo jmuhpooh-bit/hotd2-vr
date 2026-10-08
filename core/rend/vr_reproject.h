@@ -14,6 +14,7 @@
 	Copyright 2026 mikermak. This file is part of Flycast and is distributed under the GNU GPL v2 or later.
 */
 #pragma once
+#include "vr/hands_build.h"
 #include <glm/glm.hpp>
 
 struct rend_context;
@@ -82,6 +83,16 @@ struct GameCamera
 	float overlayW;
 };
 GameCamera gameCamera(const rend_context& ctx);
+
+// The agent's parts in the game over scene, for the game being played (hands_rip.h), or
+// nullptr when its profile doesn't know them.
+const hands::Parts *gameHandsParts();
+
+// The game asks for player 2 in its corner ("PRESS START BUTTON"): player 2 isn't playing.
+// Seen in the last half second (when the game's profile knows the picture).
+bool player2Prompting();
+// ...the profile knows that picture (else player 2 can't be told out again).
+bool player2PromptKnown();
 
 // Computes this frame's reprojection. Passes that must not move (render-to-texture,
 // or the feature switched off) get the identity reprojection, which reproduces the

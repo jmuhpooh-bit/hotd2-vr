@@ -160,15 +160,18 @@ public abstract class BaseGLActivity extends Activity implements ActivityCompat.
         }
         else if (getPackageName().endsWith(".vr")) {
             // hotd2-vr: started from the headset's app library. The Flycast menu can't be
-            // shown in the headset, so boot the game in the app's games folder directly.
+            // shown in the headset, so boot the player's game directly, or show the setup
+            // panel when it can't be found (or read) yet.
             String game = findVrGame();
             Log.i("flycast", "VR build started without a game, booting " + game);
-            if (game != null) {
-                if (storagePermissionGranted)
-                    JNIdc.setGameUri(game);
-                else
-                    pendingIntentUrl = game;
+            if (game == null) {
+                showVrSetup();
+                return;
             }
+            if (storagePermissionGranted)
+                JNIdc.setGameUri(game);
+            else
+                pendingIntentUrl = game;
         }
         Log.i("flycast", "BaseGLActivity.onCreate done");
     }
@@ -196,25 +199,32 @@ public abstract class BaseGLActivity extends Activity implements ActivityCompat.
         });
     }
 
-    // hotd2-vr: the first disc image in files/games (internal, then external storage)
+    // hotd2-vr: the player's game (VrGames), or null
     private String findVrGame()
     {
-        List<File> dirs = new ArrayList<>();
-        dirs.add(new File(getFilesDir(), "games"));
-        File external = getExternalFilesDir(null);
-        if (external != null)
-            dirs.add(new File(external, "games"));
-        for (File dir : dirs) {
-            File[] files = dir.listFiles();
-            if (files == null)
-                continue;
-            java.util.Arrays.sort(files);
-            for (String ext : new String[] { ".cue", ".gdi", ".chd", ".cdi" })
-                for (File f : files)
-                    if (f.isFile() && f.length() > 0 && f.getName().toLowerCase(Locale.ROOT).endsWith(ext))
-                        return f.getAbsolutePath();
+        File game = VrGames.scan(this).game;
+        return game != null ? game.getAbsolutePath() : null;
+    }
+
+    // hotd2-vr: the setup panel, in the headset's home (an immersive app opens a panel that way)
+    private void showVrSetup()
+    {
+        Intent panel = new Intent(getApplicationContext(), VrSetupActivity.class);
+        panel.setAction(Intent.ACTION_MAIN);
+        panel.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            android.app.PendingIntent pending = android.app.PendingIntent.getActivity(getApplicationContext(), 0, panel,
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_IMMUTABLE);
+            Intent home = new Intent(Intent.ACTION_MAIN)
+                    .addCategory(Intent.CATEGORY_HOME)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    .putExtra("extra_launch_in_home_pending_intent", pending);
+            startActivity(home);
+        } catch (Exception e) {
+            Log.w("flycast", "Setup panel through the home failed, opening it directly", e);
+            startActivity(panel);
         }
-        return null;
+        finish();
     }
 
     private void setStorageDirectories()

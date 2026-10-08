@@ -1,7 +1,8 @@
 /*
 	The agent's hands and pistol from the game itself (hotd2-vr). See xr_hands.h.
 
-	files/hands.bin (little endian, written by hotd2-vr/assets/rip_hands.py):
+	hands.bin in the data directory (little endian, made from the player's own game by
+	hands_rip.cpp, or on the PC by hotd2-vr/assets/rip_hands.py):
 		"HND1", u32 version 1
 		f32 muzzle[3], grab[3], travel, onSlide[16] (column major)
 		u32 textures, each: u32 width, height, flags (1 clamp u, 2 clamp v, 4 mirror u,
@@ -16,6 +17,7 @@
 	Copyright 2026 mikermak. This file is part of Flycast and is distributed under the GNU GPL v2 or later.
 */
 #include "xr_hands.h"
+#include "hands_rip.h"
 #include "rend/gles/gles.h"
 #include "rend/gles/glcache.h"
 #include "cfg/option.h"
@@ -62,24 +64,19 @@ bool tried, loaded;
 GLuint program, vbo;
 GLint uMvp = -1, uModel = -1, uEye = -1, uSpecular = -1, uShininess = -1, uAlphaTest = -1, uLight = -1, uTex = -1;
 
-// The app's internal files directory, from the game path it was started with (files/games/...).
-std::string filesDir()
-{
-	const std::string& game = settings.content.path;
-	const size_t at = game.find("/files/");
-	return at == std::string::npos ? std::string() : game.substr(0, at + 6);
-}
-
 bool load()
 {
-	const std::string dir = filesDir();
-	if (dir.empty())
-		return false;
-	const std::string path = dir + "/hands.bin";
-	FILE *f = fopen(path.c_str(), "rb");
+	// where older builds had it: the app's internal files
+	std::string path = hands::modelPath();
+	FILE *f = nowide::fopen(path.c_str(), "rb");
+	if (f == nullptr && !hands::legacyModelPath().empty())
+	{
+		path = hands::legacyModelPath();
+		f = nowide::fopen(path.c_str(), "rb");
+	}
 	if (f == nullptr)
 	{
-		INFO_LOG(RENDERER, "XR: no %s, the arcade gun it is", path.c_str());
+		INFO_LOG(RENDERER, "XR: no %s, the arcade gun it is", hands::modelPath().c_str());
 		return false;
 	}
 	bool ok = true;
@@ -273,6 +270,13 @@ void drawMesh(int mesh, const glm::mat4& viewProj, const glm::mat4& pose, float 
 
 const HandsModel *handsModel()
 {
+	if (hands::takeNewModel())
+	{
+		// just made from the game: in with it
+		termHands();
+		model = Model();
+		tried = false;
+	}
 	if (!tried)
 	{
 		tried = true;

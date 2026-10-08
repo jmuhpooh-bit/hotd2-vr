@@ -87,7 +87,7 @@ void lightgunSet(int player, int x, int y, u32 buttons)
 	const u32 changed = buttons ^ lastButtons[player];
 	if (changed & 1)
 		setButton(player, DC_BTN_A, buttons & 1);
-	if ((changed & 1) && (buttons & 1) && player == 0)
+	if ((changed & 1) && (buttons & 1) && player <= 1)
 		// the game draws its own shot marker here (see vr::dropShotMarker)
 		vr::noteGunShot(mo_x_abs[player], mo_y_abs[player], (buttons & 256) == 0);
 	if (changed & 2)

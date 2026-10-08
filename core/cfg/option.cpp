@@ -95,7 +95,11 @@ Option<float> VrOffsetZ("vr.OffsetZ", 0.f);
 Option<bool> VrAnimate("vr.Animate");		// sway the free camera by the amplitudes above
 Option<int> VrUdpPort("vr.UdpPort", 0);	// lightgun input over UDP on 127.0.0.1, 0 = off
 // Headset (OpenXR builds only)
+#ifdef __ANDROID__
 Option<bool> VrXr("vr.Xr", true);			// immersive view in the headset
+#else
+Option<bool> VrXr("vr.Xr", false);			// PCVR (OpenXR), when asked: the PCVR zip's emu.cfg does
+#endif
 Option<bool> VrXrGun("vr.XrGun", true);		// the controllers drive the light gun (the one that fires holds it)
 Option<bool> VrWiden("vr.Widen", true);		// let the game profile widen the view (vr.FovScale)
 Option<float> VrWorldScale("vr.WorldScale", 0.025f);	// metres per game unit
@@ -107,6 +111,9 @@ Option<float> VrGunScale("vr.GunScale", 0.68f);	// its size, times the model's (
 Option<bool> VrGameHands("vr.GameHands", true);	// the agent's own hands and pistol from the game, when files/hands.bin is there
 Option<float> VrHandScale("vr.HandScale", 1.f);	// their size, times the ripped model's (a 20 cm pistol)
 Option<bool> VrSlideReload("vr.SlideReload", true);	// with them, the other hand racks the slide to reload
+Option<bool> VrDualWield("vr.DualWield", true);	// the left controller's Start: player 2 joins, a gun in each hand
+Option<bool> VrHideP2Prompt("vr.HideP2Prompt", true);	// no "PRESS START BUTTON" for player 2 floating in the room
+Option<bool> VrHandsPrep("vr.HandsPrep", false);	// PC: with no hands model, run the game to its game over scene for one (the headset always does)
 Option<float> VrComfortStart("vr.ComfortStart", 0.8f);	// metres; closer things get pulled back (0: off)
 Option<float> VrComfortMin("vr.ComfortMin", 0.4f);	// metres; ...but never closer than this
 Option<bool> VrAimWidened("vr.AimWidened", false);	// aim on the widened view (the game's hit test uses its stock view)

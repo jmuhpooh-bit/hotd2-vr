@@ -16,11 +16,22 @@
 #ifdef USE_OPENXR
 #include "xr_gun.h"
 #include "xr_hands.h"
+#include "xr_panel.h"
+#include "hands_rip.h"
+#include "rend/gles/gles.h"
+#ifdef __ANDROID__
+// the Quest: OpenGL ES through EGL
 #include <jni.h>
 #include <glad/egl.h>
-#include "rend/gles/gles.h"
 #define XR_USE_PLATFORM_ANDROID
 #define XR_USE_GRAPHICS_API_OPENGL_ES
+#else
+// PCVR: desktop OpenGL through WGL
+#include <windows.h>
+#include <unknwn.h>
+#define XR_USE_PLATFORM_WIN32
+#define XR_USE_GRAPHICS_API_OPENGL
+#endif
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
@@ -31,6 +42,8 @@
 #include "input/udp_lightgun.h"
 #include "cfg/option.h"
 #include "cfg/cfg.h"
+#include "stdclass.h"
+#include "emulator.h"
 #include "log/Log.h"
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -43,16 +56,30 @@
 #include <cstring>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 
+#ifdef __ANDROID__
 extern JavaVM *g_jvm;
 extern jobject g_activity;
+#endif
 
 namespace vr::xr
 {
 namespace
 {
+
+#ifdef __ANDROID__
+using SwapchainImage = XrSwapchainImageOpenGLESKHR;
+constexpr XrStructureType SwapchainImageType = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR;
+// Plain RGBA8: the game's colours were made for a gamma display, like the eye buffers.
+constexpr int64_t SwapchainFormats[] { GL_RGBA8 };
+#else
+using SwapchainImage = XrSwapchainImageOpenGLKHR;
+constexpr XrStructureType SwapchainImageType = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
+// PC runtimes take RGBA8 as linear and brighten it. An sRGB image written to as it is (no
+// GL_FRAMEBUFFER_SRGB) shows the colours as on the Quest.
+constexpr int64_t SwapchainFormats[] { GL_SRGB8_ALPHA8, GL_RGBA8 };
+#endif
 
 constexpr float NearMetres = 0.05f;
 constexpr u32 RestartIndex = 0xFFFFFFFFu;
@@ -61,12 +88,10 @@ XrInstance instance = XR_NULL_HANDLE;
 XrSystemId systemId = XR_NULL_SYSTEM_ID;
 XrSession session = XR_NULL_HANDLE;
 XrSpace localSpace = XR_NULL_HANDLE;
-// Either controller can be the gun: the one whose trigger was pulled last.
 constexpr int Left = 0, Right = 1;
 XrPath handPaths[2];
 XrSpace aimSpaces[2];
 XrSpace gripSpaces[2];		// the hand on the handle (grip pose): where the gun's grip goes
-int gunHand = Right;
 XrActionSet actionSet = XR_NULL_HANDLE;
 XrAction aimAction, handAction, triggerAction, startAction, skipAction, recenterAction, hapticAction, stickAction, gripAction;
 PFN_xrRequestDisplayRefreshRateFB requestRefreshRate;
@@ -84,7 +109,7 @@ struct EyeChain
 {
 	XrSwapchain chain = XR_NULL_HANDLE;
 	int width = 0, height = 0;
-	std::vector<XrSwapchainImageOpenGLESKHR> images;
+	std::vector<SwapchainImage> images;
 	std::vector<GLuint> fbos;
 	GLuint depthStencil = 0;
 };
@@ -100,16 +125,41 @@ bool recenterRequested;
 glm::vec3 originPos;
 glm::quat originRot { 1, 0, 0, 0 };
 
-// Light gun state
-bool triggerWas, recenterWas;
-// The current pull started outside the game's view (aimOutside): it does nothing until
-// the trigger is let go, even when the aim moves into view.
-bool pullOutside;
-// The pistol as drawn: where it is (no pose: hidden), and the last shot for recoil/flash.
-GunView gunView;
-bool gunVisible;
-XrTime lastShot;
-unsigned shotCount;
+// The light guns. Player 1's is in the hand whose trigger was pulled last; once player 2
+// joins (vr.DualWield: the left controller's Start), player 1's is in the right hand and
+// player 2's in the left: dual wielding.
+struct Gun
+{
+	int player;
+	int hand = Right;
+	bool triggerWas;
+	// The current pull started outside the game's view (aimOutside): it does nothing until
+	// the trigger is let go, even when the aim moves into view.
+	bool pullOutside;
+	XrTime lastShot;
+	unsigned shotCount;
+	// When the last reload started (racked slide, gun pointed down; 0: done), and a
+	// trigger held through it.
+	XrTime reloadAt;
+	bool triggerWait;
+	bool pointedDown;
+	// as drawn (no pose: hidden), with the last shot for recoil and flash
+	GunView view;
+	bool visible;
+	int palmLogged = -1;	// hand * 2 + where the palm came from, as last logged
+};
+Gun guns[2] { { 0 }, { 1, Left } };
+bool dualWield;
+XrTime dualSince;
+bool leftStartWas, recenterWas;
+// A game (re)started: one gun again (EventManager calls on the emulator's thread).
+std::atomic<bool> newGame;
+struct NewGameRegistration
+{
+	NewGameRegistration() {
+		EventManager::listen(Event::Start, [](Event, void *) { newGame = true; });
+	}
+} newGameRegistration;
 // for capture-shot.request: trigger pulls so far, and where the last one went (DC pixels)
 std::atomic<u32> shotSerial;
 glm::vec2 lastShotScreen(-1.f);
@@ -159,44 +209,115 @@ bool initActions()
 	if (!createAction(aimAction, "aim", "Aim", XR_ACTION_TYPE_POSE_INPUT, true)
 			|| !createAction(handAction, "hand", "Hand (holds the gun)", XR_ACTION_TYPE_POSE_INPUT, true)
 			|| !createAction(triggerAction, "trigger", "Fire", XR_ACTION_TYPE_FLOAT_INPUT, true)
-			|| !createAction(startAction, "start", "Start", XR_ACTION_TYPE_BOOLEAN_INPUT)
-			|| !createAction(skipAction, "skip", "Skip, back (the gun's B)", XR_ACTION_TYPE_BOOLEAN_INPUT)
+			|| !createAction(startAction, "start", "Start (left: player 2 joins)", XR_ACTION_TYPE_BOOLEAN_INPUT, true)
+			|| !createAction(skipAction, "skip", "Skip, back (the gun's B)", XR_ACTION_TYPE_BOOLEAN_INPUT, true)
 			|| !createAction(recenterAction, "recenter", "Recenter", XR_ACTION_TYPE_BOOLEAN_INPUT)
 			|| !createAction(hapticAction, "recoil", "Recoil", XR_ACTION_TYPE_VIBRATION_OUTPUT, true)
 			|| !createAction(stickAction, "stick", "Menus (D-pad), world size", XR_ACTION_TYPE_VECTOR2F_INPUT)
 			|| !createAction(gripAction, "grip", "Rack the slide; hold for world size", XR_ACTION_TYPE_FLOAT_INPUT, true))
 		return false;
-	// Either trigger fires; shooting away from the screen reloads. Start (pauses): A, or the
-	// menu button on the left. The gun's B (skips a story scene, backs out of menus): B or
-	// Y, under the thumb of whichever hand holds the gun. Recenter: X, or a thumbstick click.
+	// Either trigger fires; shooting away from the screen reloads. Start (pauses): A. The
+	// menu button on the left lets player 2 join (vr.DualWield), else it is player 1's Start
+	// too. The gun's B (skips a story scene, backs out of menus): B or Y, under the thumb of
+	// whichever hand holds the gun (with two guns: each its player's). Recenter: X, or a thumbstick click.
 	// Thumbstick: the gun's D-pad (menus); with a grip held, up/down sizes the world. The
 	// other hand's grip racks the game pistol's slide.
-	const XrActionSuggestedBinding bindings[] {
-		{ stickAction, path("/user/hand/left/input/thumbstick") },
-		{ stickAction, path("/user/hand/right/input/thumbstick") },
-		{ gripAction, path("/user/hand/left/input/squeeze/value") },
-		{ gripAction, path("/user/hand/right/input/squeeze/value") },
-		{ aimAction, path("/user/hand/left/input/aim/pose") },
-		{ aimAction, path("/user/hand/right/input/aim/pose") },
-		{ handAction, path("/user/hand/left/input/grip/pose") },
-		{ handAction, path("/user/hand/right/input/grip/pose") },
-		{ triggerAction, path("/user/hand/left/input/trigger/value") },
-		{ triggerAction, path("/user/hand/right/input/trigger/value") },
-		{ startAction, path("/user/hand/right/input/a/click") },
-		{ startAction, path("/user/hand/left/input/menu/click") },
-		{ skipAction, path("/user/hand/right/input/b/click") },
-		{ skipAction, path("/user/hand/left/input/y/click") },
-		{ recenterAction, path("/user/hand/left/input/x/click") },
-		{ recenterAction, path("/user/hand/left/input/thumbstick/click") },
-		{ recenterAction, path("/user/hand/right/input/thumbstick/click") },
-		{ hapticAction, path("/user/hand/left/output/haptic") },
-		{ hapticAction, path("/user/hand/right/output/haptic") },
+	auto suggest = [](const char *profile, std::initializer_list<std::pair<XrAction, const char *>> list) {
+		std::vector<XrActionSuggestedBinding> bindings;
+		for (const auto& [action, where] : list)
+			bindings.push_back({ action, path(where) });
+		XrInteractionProfileSuggestedBinding suggested { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+		suggested.interactionProfile = path(profile);
+		suggested.countSuggestedBindings = (u32)bindings.size();
+		suggested.suggestedBindings = bindings.data();
+		return check(xrSuggestInteractionProfileBindings(instance, &suggested), profile);
 	};
-	XrInteractionProfileSuggestedBinding suggested { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
-	suggested.interactionProfile = path("/interaction_profiles/oculus/touch_controller");
-	suggested.countSuggestedBindings = (u32)std::size(bindings);
-	suggested.suggestedBindings = bindings;
-	if (!XRCHECK(xrSuggestInteractionProfileBindings(instance, &suggested)))
+	bool any = suggest("/interaction_profiles/oculus/touch_controller", {
+		{ stickAction, "/user/hand/left/input/thumbstick" },
+		{ stickAction, "/user/hand/right/input/thumbstick" },
+		{ gripAction, "/user/hand/left/input/squeeze/value" },
+		{ gripAction, "/user/hand/right/input/squeeze/value" },
+		{ aimAction, "/user/hand/left/input/aim/pose" },
+		{ aimAction, "/user/hand/right/input/aim/pose" },
+		{ handAction, "/user/hand/left/input/grip/pose" },
+		{ handAction, "/user/hand/right/input/grip/pose" },
+		{ triggerAction, "/user/hand/left/input/trigger/value" },
+		{ triggerAction, "/user/hand/right/input/trigger/value" },
+		{ startAction, "/user/hand/right/input/a/click" },
+		{ startAction, "/user/hand/left/input/menu/click" },
+		{ skipAction, "/user/hand/right/input/b/click" },
+		{ skipAction, "/user/hand/left/input/y/click" },
+		{ recenterAction, "/user/hand/left/input/x/click" },
+		{ recenterAction, "/user/hand/left/input/thumbstick/click" },
+		{ recenterAction, "/user/hand/right/input/thumbstick/click" },
+		{ hapticAction, "/user/hand/left/output/haptic" },
+		{ hapticAction, "/user/hand/right/output/haptic" },
+	});
+#ifndef __ANDROID__
+	// PCVR: the other controllers, as near as they come: a Start on each hand (the left one
+	// lets player 2 join) and the gun's B. Index: A and B, recenter with a stick click. Vive
+	// wands and Windows Mixed Reality: the menu button is Start, a click on the pad the gun's
+	// B; the pad or stick is the D-pad.
+	any |= suggest("/interaction_profiles/valve/index_controller", {
+		{ stickAction, "/user/hand/left/input/thumbstick" },
+		{ stickAction, "/user/hand/right/input/thumbstick" },
+		{ gripAction, "/user/hand/left/input/squeeze/value" },
+		{ gripAction, "/user/hand/right/input/squeeze/value" },
+		{ aimAction, "/user/hand/left/input/aim/pose" },
+		{ aimAction, "/user/hand/right/input/aim/pose" },
+		{ handAction, "/user/hand/left/input/grip/pose" },
+		{ handAction, "/user/hand/right/input/grip/pose" },
+		{ triggerAction, "/user/hand/left/input/trigger/value" },
+		{ triggerAction, "/user/hand/right/input/trigger/value" },
+		{ startAction, "/user/hand/right/input/a/click" },
+		{ startAction, "/user/hand/left/input/a/click" },
+		{ skipAction, "/user/hand/right/input/b/click" },
+		{ skipAction, "/user/hand/left/input/b/click" },
+		{ recenterAction, "/user/hand/left/input/thumbstick/click" },
+		{ recenterAction, "/user/hand/right/input/thumbstick/click" },
+		{ hapticAction, "/user/hand/left/output/haptic" },
+		{ hapticAction, "/user/hand/right/output/haptic" },
+	});
+	any |= suggest("/interaction_profiles/htc/vive_controller", {
+		{ stickAction, "/user/hand/left/input/trackpad" },
+		{ stickAction, "/user/hand/right/input/trackpad" },
+		{ gripAction, "/user/hand/left/input/squeeze/click" },
+		{ gripAction, "/user/hand/right/input/squeeze/click" },
+		{ aimAction, "/user/hand/left/input/aim/pose" },
+		{ aimAction, "/user/hand/right/input/aim/pose" },
+		{ handAction, "/user/hand/left/input/grip/pose" },
+		{ handAction, "/user/hand/right/input/grip/pose" },
+		{ triggerAction, "/user/hand/left/input/trigger/value" },
+		{ triggerAction, "/user/hand/right/input/trigger/value" },
+		{ startAction, "/user/hand/right/input/menu/click" },
+		{ startAction, "/user/hand/left/input/menu/click" },
+		{ skipAction, "/user/hand/right/input/trackpad/click" },
+		{ skipAction, "/user/hand/left/input/trackpad/click" },
+		{ hapticAction, "/user/hand/left/output/haptic" },
+		{ hapticAction, "/user/hand/right/output/haptic" },
+	});
+	any |= suggest("/interaction_profiles/microsoft/motion_controller", {
+		{ stickAction, "/user/hand/left/input/thumbstick" },
+		{ stickAction, "/user/hand/right/input/thumbstick" },
+		{ gripAction, "/user/hand/left/input/squeeze/click" },
+		{ gripAction, "/user/hand/right/input/squeeze/click" },
+		{ aimAction, "/user/hand/left/input/aim/pose" },
+		{ aimAction, "/user/hand/right/input/aim/pose" },
+		{ handAction, "/user/hand/left/input/grip/pose" },
+		{ handAction, "/user/hand/right/input/grip/pose" },
+		{ triggerAction, "/user/hand/left/input/trigger/value" },
+		{ triggerAction, "/user/hand/right/input/trigger/value" },
+		{ startAction, "/user/hand/right/input/menu/click" },
+		{ startAction, "/user/hand/left/input/menu/click" },
+		{ skipAction, "/user/hand/right/input/trackpad/click" },
+		{ skipAction, "/user/hand/left/input/trackpad/click" },
+		{ recenterAction, "/user/hand/left/input/thumbstick/click" },
+		{ recenterAction, "/user/hand/right/input/thumbstick/click" },
+		{ hapticAction, "/user/hand/left/output/haptic" },
+		{ hapticAction, "/user/hand/right/output/haptic" },
+	});
+#endif
+	if (!any)
 		return false;
 	XrSessionActionSetsAttachInfo attach { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
 	attach.countActionSets = 1;
@@ -226,8 +347,11 @@ bool initSwapchains()
 	std::vector<int64_t> formats(formatCount);
 	if (!XRCHECK(xrEnumerateSwapchainFormats(session, formatCount, &formatCount, formats.data())))
 		return false;
-	// Plain RGBA8: the game's colours were made for a gamma display, like the eye buffers.
-	if (std::find(formats.begin(), formats.end(), (int64_t)GL_RGBA8) == formats.end())
+	int64_t format = 0;
+	for (int64_t wanted : SwapchainFormats)
+		if (format == 0 && std::find(formats.begin(), formats.end(), wanted) != formats.end())
+			format = wanted;
+	if (format == 0)
 	{
 		ERROR_LOG(RENDERER, "XR: no RGBA8 swapchain format");
 		return false;
@@ -247,7 +371,7 @@ bool initSwapchains()
 		c.height = (int)(configViews[i].recommendedImageRectHeight * scale);
 		XrSwapchainCreateInfo info { XR_TYPE_SWAPCHAIN_CREATE_INFO };
 		info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-		info.format = GL_RGBA8;
+		info.format = format;
 		info.sampleCount = 1;
 		info.width = c.width;
 		info.height = c.height;
@@ -259,7 +383,7 @@ bool initSwapchains()
 		u32 imageCount = 0;
 		if (!XRCHECK(xrEnumerateSwapchainImages(c.chain, 0, &imageCount, nullptr)))
 			return false;
-		c.images.assign(imageCount, { XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR });
+		c.images.assign(imageCount, { SwapchainImageType });
 		if (!XRCHECK(xrEnumerateSwapchainImages(c.chain, imageCount, &imageCount, (XrSwapchainImageBaseHeader *)c.images.data())))
 			return false;
 		// Depth with stencil: the renderer uses stencil for modifier volumes (shadows).
@@ -288,6 +412,7 @@ bool initSwapchains()
 bool init()
 {
 	initTried = true;
+#ifdef __ANDROID__
 	if (g_jvm == nullptr || g_activity == nullptr)
 	{
 		ERROR_LOG(RENDERER, "XR: no Java VM / activity");
@@ -301,10 +426,16 @@ bool init()
 	loaderInfo.applicationContext = g_activity;
 	if (!XRCHECK(initLoader((const XrLoaderInitInfoBaseHeaderKHR *)&loaderInfo)))
 		return false;
+	const char *graphicsExtension = XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME;
+	std::vector<const char *> extensions { XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, graphicsExtension };
+#else
+	const char *graphicsExtension = XR_KHR_OPENGL_ENABLE_EXTENSION_NAME;
+	std::vector<const char *> extensions { graphicsExtension };
+#endif
 
-	std::vector<const char *> extensions { XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME };
 	u32 available = 0;
-	XRCHECK(xrEnumerateInstanceExtensionProperties(nullptr, 0, &available, nullptr));
+	if (!XRCHECK(xrEnumerateInstanceExtensionProperties(nullptr, 0, &available, nullptr)))
+		return false;	// no OpenXR runtime (PC: no SteamVR, Quest Link or Virtual Desktop running)
 	std::vector<XrExtensionProperties> props(available, { XR_TYPE_EXTENSION_PROPERTIES });
 	XRCHECK(xrEnumerateInstanceExtensionProperties(nullptr, available, &available, props.data()));
 	auto has = [&](const char *name) {
@@ -313,6 +444,11 @@ bool init()
 				return true;
 		return false;
 	};
+	if (!has(graphicsExtension))
+	{
+		ERROR_LOG(RENDERER, "XR: the OpenXR runtime has no %s", graphicsExtension);
+		return false;
+	}
 	const bool refreshRates = has(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
 	const bool perfSettings = has(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
 	if (refreshRates)
@@ -320,11 +456,13 @@ bool init()
 	if (perfSettings)
 		extensions.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
 
+	XrInstanceCreateInfo createInfo { XR_TYPE_INSTANCE_CREATE_INFO };
+#ifdef __ANDROID__
 	XrInstanceCreateInfoAndroidKHR androidInfo { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
 	androidInfo.applicationVM = g_jvm;
 	androidInfo.applicationActivity = g_activity;
-	XrInstanceCreateInfo createInfo { XR_TYPE_INSTANCE_CREATE_INFO };
 	createInfo.next = &androidInfo;
+#endif
 	createInfo.enabledExtensionCount = (u32)extensions.size();
 	createInfo.enabledExtensionNames = extensions.data();
 	strcpy(createInfo.applicationInfo.applicationName, "HOTD2 VR");
@@ -338,11 +476,17 @@ bool init()
 		xrGetInstanceProcAddr(instance, "xrRequestDisplayRefreshRateFB", (PFN_xrVoidFunction *)&requestRefreshRate);
 	if (perfSettings)
 		xrGetInstanceProcAddr(instance, "xrPerfSettingsSetPerformanceLevelEXT", (PFN_xrVoidFunction *)&setPerformanceLevel);
+	XrInstanceProperties instanceProps { XR_TYPE_INSTANCE_PROPERTIES };
+	if (XR_SUCCEEDED(xrGetInstanceProperties(instance, &instanceProps)))
+		NOTICE_LOG(RENDERER, "XR: runtime %s", instanceProps.runtimeName);
 
 	XrSystemGetInfo systemInfo { XR_TYPE_SYSTEM_GET_INFO };
 	systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
 	if (!XRCHECK(xrGetSystem(instance, &systemInfo, &systemId)))
-		return false;
+		return false;	// (PC: the headset isn't connected)
+
+	// Bind the session to Flycast's own GL context, current on this thread.
+#ifdef __ANDROID__
 	PFN_xrGetOpenGLESGraphicsRequirementsKHR getRequirements = nullptr;
 	if (!XRCHECK(xrGetInstanceProcAddr(instance, "xrGetOpenGLESGraphicsRequirementsKHR", (PFN_xrVoidFunction *)&getRequirements)))
 		return false;
@@ -350,7 +494,6 @@ bool init()
 	if (!XRCHECK(getRequirements(instance, systemId, &requirements)))
 		return false;
 
-	// Bind the session to Flycast's own GL context, current on this thread.
 	EGLDisplay display = eglGetCurrentDisplay();
 	EGLContext context = eglGetCurrentContext();
 	EGLint configId = 0, configCount = 0;
@@ -370,6 +513,25 @@ bool init()
 	binding.display = display;
 	binding.config = eglConfig;
 	binding.context = context;
+#else
+	PFN_xrGetOpenGLGraphicsRequirementsKHR getRequirements = nullptr;
+	if (!XRCHECK(xrGetInstanceProcAddr(instance, "xrGetOpenGLGraphicsRequirementsKHR", (PFN_xrVoidFunction *)&getRequirements)))
+		return false;
+	XrGraphicsRequirementsOpenGLKHR requirements { XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR };
+	if (!XRCHECK(getRequirements(instance, systemId, &requirements)))
+		return false;
+
+	XrGraphicsBindingOpenGLWin32KHR binding { XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR };
+	binding.hDC = wglGetCurrentDC();
+	binding.hGLRC = wglGetCurrentContext();
+	if (binding.hDC == nullptr || binding.hGLRC == nullptr)
+	{
+		ERROR_LOG(RENDERER, "XR: no current OpenGL context (the PC version needs the OpenGL renderer)");
+		return false;
+	}
+	// what goes into the sRGB eye images goes in as it is (see SwapchainFormats)
+	glDisable(GL_FRAMEBUFFER_SRGB);
+#endif
 	XrSessionCreateInfo sessionInfo { XR_TYPE_SESSION_CREATE_INFO };
 	sessionInfo.next = &binding;
 	sessionInfo.systemId = systemId;
@@ -735,10 +897,13 @@ bool aimAtFlatScreen(const glm::vec3& o, const glm::vec3& d, glm::vec2& screen, 
 	return onGameScreen(screen);
 }
 
-bool boolAction(XrAction action)
+// A button, of either hand or (for per-hand actions) of one
+bool boolAction(XrAction action, int hand = -1)
 {
 	XrActionStateGetInfo info { XR_TYPE_ACTION_STATE_GET_INFO };
 	info.action = action;
+	if (hand >= 0)
+		info.subactionPath = handPaths[hand];
 	XrActionStateBoolean state { XR_TYPE_ACTION_STATE_BOOLEAN };
 	return XR_SUCCEEDED(xrGetActionStateBoolean(session, &info, &state)) && state.isActive && state.currentState;
 }
@@ -764,9 +929,9 @@ void haptic(int hand, float seconds, float amplitude)
 	xrApplyHapticFeedback(session, &info, (const XrHapticBaseHeader *)&vibration);
 }
 
-void recoil()
+void recoil(int hand)
 {
-	haptic(gunHand, 0.03f, 1.f);	// a sharp knock
+	haptic(hand, 0.03f, 1.f);	// a sharp knock
 }
 
 glm::vec2 stickAction2()
@@ -860,9 +1025,6 @@ struct Slide
 	float back;			// how far back the slide is (model metres)
 	XrTime time;
 } slide;
-// When the last rack reloaded (0: done), and a trigger held through it.
-XrTime reloadAt;
-bool triggerWait;
 // How far the hand (the controller's grip) may be from the back of the slide to take it:
 // the controllers can't overlap, and the pistol's back sits over the gun hand's ring.
 constexpr float GrabReach = 0.11f;
@@ -873,6 +1035,7 @@ void updateOtherHand(XrTime time, int hand, bool tracked, const XrSpaceLocation&
 	const HandsModel *model = handsModel();
 	const float dt = slide.time != 0 ? std::clamp((time - slide.time) * 1e-9f, 0.f, 0.1f) : 0.f;
 	slide.time = time;
+	GunView& gunView = guns[0].view;
 	gunView.otherHand = false;
 	if (!tracked || model == nullptr)
 		slide.held = false;
@@ -916,9 +1079,9 @@ void updateOtherHand(XrTime time, int hand, bool tracked, const XrSpaceLocation&
 			if (!slide.racked && slide.back > model->travel * 0.85f)
 			{
 				slide.racked = true;
-				reloadAt = time;
+				guns[0].reloadAt = time;
 				haptic(hand, 0.025f, 0.8f);
-				haptic(gunHand, 0.025f, 0.6f);
+				haptic(guns[0].hand, 0.025f, 0.6f);
 				NOTICE_LOG(INPUT, "XR: slide racked (reload)");
 			}
 		}
@@ -934,67 +1097,30 @@ void updateOtherHand(XrTime time, int hand, bool tracked, const XrSpaceLocation&
 		// home it goes, fast
 		slide.back = std::max(0.f, slide.back - dt * 1.5f);
 		if (slide.back == 0.f && slide.clack)
-			haptic(gunHand, 0.02f, 0.7f);
+			haptic(guns[0].hand, 0.02f, 0.7f);
 	}
 	if (slide.back == 0.f)
 		slide.clack = false;
 	gunView.slide = slide.back;
 }
 
-void updateLightgun(XrTime time)
+// One gun for a headset frame: where it points (handed to the game's hit test at its stock
+// framing), how it's drawn, and the buttons that go to its player's light gun. `extra` are
+// the buttons that aren't the trigger's (Start, B, the D-pad). With `slide`, the other hand
+// (`other`) is free to rack the game pistol's slide.
+void updateGun(Gun& g, XrTime time, const XrSpaceLocation *locations, const bool *tracked, const float *pulls,
+		u32 extra, bool slide)
 {
-	gunVisible = false;
-	if (!config::VrXrGun)
-		return;
-	if (!focused)
-	{
-		// headset menu or app in the background: let go of everything
-		lightgunSet(0, OffScreen, OffScreen, 0);
-		triggerWas = false;
-		return;
-	}
-	const XrActiveActionSet active { actionSet, XR_NULL_PATH };
-	XrActionsSyncInfo sync { XR_TYPE_ACTIONS_SYNC_INFO };
-	sync.countActiveActionSets = 1;
-	sync.activeActionSets = &active;
-	if (!XR_SUCCEEDED(xrSyncActions(session, &sync)))
-		return;
-
-	const bool recenter = boolAction(recenterAction);
-	if (recenter && !recenterWas)
-		recenterRequested = true;
-	recenterWas = recenter;
-	const glm::vec2 stick = stickAction2();
-	const u32 dpad = adjustWorldSize(time, stick) ? dpadFromStick(glm::vec2(0.f)) : dpadFromStick(stick);
-
-	// Which hand holds the gun: the one whose trigger is pulled while the gun hand's isn't,
-	// or the other one when the gun hand's controller is gone (asleep, battery).
-	const XrSpaceLocationFlags valid = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-	XrSpaceLocation locations[2] { { XR_TYPE_SPACE_LOCATION }, { XR_TYPE_SPACE_LOCATION } };
-	bool tracked[2];
-	float pulls[2];
-	for (int hand : { Left, Right })
-	{
-		tracked[hand] = XR_SUCCEEDED(xrLocateSpace(aimSpaces[hand], localSpace, time, &locations[hand]))
-				&& (locations[hand].locationFlags & valid) == valid;
-		pulls[hand] = tracked[hand] ? floatAction(triggerAction, hand) : 0.f;
-	}
-	const int otherHand = 1 - gunHand;
-	if (!triggerWas && ((tracked[otherHand] && !tracked[gunHand]) || (pulls[otherHand] > 0.6f && pulls[gunHand] < 0.35f)))
-	{
-		gunHand = otherHand;
-		NOTICE_LOG(INPUT, "XR: the gun is in the %s hand", gunHand == Right ? "right" : "left");
-	}
-
 	// A clean click: pulled past 60%, let go below 35%, so a resting finger or a half
 	// release doesn't fire twice.
-	const float pull = pulls[gunHand];
-	const bool trigger = triggerWas ? pull > 0.35f : pull > 0.6f;
+	const float pull = pulls[g.hand];
+	const bool trigger = g.triggerWas ? pull > 0.35f : pull > 0.6f;
 
 	glm::vec2 screen(-1.f);
 	bool onScreen = false;
-	const XrSpaceLocation& location = locations[gunHand];
-	if (originSet && tracked[gunHand])
+	aimOutside = false;
+	const XrSpaceLocation& location = locations[g.hand];
+	if (originSet && tracked[g.hand])
 	{
 		const glm::quat rot = relativeRotation(location.pose.orientation);
 		const glm::mat4 pose = glm::translate(glm::mat4(1.f), relativePosition(location.pose.position)) * glm::mat4_cast(rot);
@@ -1002,22 +1128,21 @@ void updateLightgun(XrTime time)
 		// pose, seen from the aim pose), at vr.GunScale times the model's size.
 		glm::vec3 palm = HandPalm;
 		XrSpaceLocation grip { XR_TYPE_SPACE_LOCATION };
-		const bool fromRuntime = XR_SUCCEEDED(xrLocateSpace(gripSpaces[gunHand], aimSpaces[gunHand], time, &grip))
+		const bool fromRuntime = XR_SUCCEEDED(xrLocateSpace(gripSpaces[g.hand], aimSpaces[g.hand], time, &grip))
 				&& (grip.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
 				&& glm::length(toVec(grip.pose.position)) < 0.25f;
 		if (fromRuntime)
 			palm = toVec(grip.pose.position);
-		static int palmLogged = -1;		// hand * 2 + where it came from
-		if (palmLogged != gunHand * 2 + fromRuntime)
+		if (g.palmLogged != g.hand * 2 + fromRuntime)
 		{
-			palmLogged = gunHand * 2 + fromRuntime;
-			NOTICE_LOG(INPUT, "XR: %s hand at %.3f %.3f %.3f from the aim pose (%s)", gunHand == Right ? "right" : "left",
+			g.palmLogged = g.hand * 2 + fromRuntime;
+			NOTICE_LOG(INPUT, "XR: %s hand at %.3f %.3f %.3f from the aim pose (%s)", g.hand == Right ? "right" : "left",
 					palm.x, palm.y, palm.z, fromRuntime ? "runtime" : "fallback");
 		}
 		const bool game = gameGun();
 		const float gunScale = std::clamp(game ? (float)config::VrHandScale : (float)config::VrGunScale, 0.4f, 1.6f);
 		// the game's pistol is in a right hand: mirrored for the left
-		const bool mirror = game && gunHand == Left;
+		const bool mirror = game && g.hand == Left;
 		const glm::mat4 placement = gunPlacement(game, gunScale, palm, mirror);
 		// Shots leave the muzzle along the barrel, so the aim line and the hit agree. Into
 		// rebuilt game eye space for the hit test.
@@ -1027,7 +1152,6 @@ void updateLightgun(XrTime time)
 		const glm::vec3 og = glm::vec3(o.x, -o.y, o.z) / s;
 		const glm::vec3 dg = glm::normalize(glm::vec3(d.x, -d.y, d.z));
 		float dist = -1.f;
-		aimOutside = false;
 		const rend_context *ctx = gles_vr_frame();
 		if (gles_vr_showing_framebuffer())
 			onScreen = aimAtFlatScreen(og, dg, screen, dist);
@@ -1037,39 +1161,55 @@ void updateLightgun(XrTime time)
 		// Recoil: back and muzzle up around the hand, with a small bounce (gunKick) and a
 		// little sideways twist that differs per shot. A shot fired now shows its flash
 		// and kick in this very frame.
-		if (trigger && !triggerWas && onScreen)
+		if (trigger && !g.triggerWas && onScreen)
 		{
-			lastShot = time;
-			shotCount++;
+			g.lastShot = time;
+			g.shotCount++;
 		}
-		const float sinceShot = lastShot != 0 ? (time - lastShot) * 1e-9f : 1e9f;
+		const float sinceShot = g.lastShot != 0 ? (time - g.lastShot) * 1e-9f : 1e9f;
 		const float kick = gunKick(sinceShot);
-		const float twist = ((shotCount * 2654435761u) >> 24) / 255.f - 0.5f;	// -0.5..0.5 per shot
+		const float twist = ((g.shotCount * 2654435761u) >> 24) / 255.f - 0.5f;	// -0.5..0.5 per shot
 		const glm::vec3 hand = palm;
 		glm::mat4 recoilMat = glm::translate(glm::mat4(1.f), glm::vec3(0.f, 0.f, 0.035f * kick) + hand);
 		recoilMat = glm::rotate(recoilMat, glm::radians(18.f * kick), glm::vec3(1, 0, 0));
 		recoilMat = glm::rotate(recoilMat, glm::radians(6.f * twist * std::max(kick, 0.f)), glm::vec3(0, 1, 0));
 		recoilMat = glm::translate(recoilMat, -hand);
-		gunView.pose = pose * recoilMat * placement;
+		GunView& view = g.view;
+		view.pose = pose * recoilMat * placement;
 		// (the game's pistol has a smaller muzzle than the arcade gun's lens)
-		gunView.scale = game ? gunScale * 0.8f : gunScale;
-		gunView.restMuzzle = o;
-		gunView.restForward = d;
-		gunView.trigger = std::clamp(pull, 0.f, 1.f);
-		gunView.now = time * 1e-9;
-		gunView.sinceShot = sinceShot;
-		gunView.shot = shotCount;
-		gunView.aimLine = config::VrLaser;
-		gunView.aimDot = config::VrLaser && (onScreen || aimOutside);
-		gunView.aimOutside = aimOutside && !onScreen;
-		gunView.aimPoint = o + d * (dist > 0.f ? dist * s : 5.f);
-		gunVisible = config::VrShowGun;
-		if (game)
-			updateOtherHand(time, 1 - gunHand, tracked[1 - gunHand], locations[1 - gunHand], pose * placement, gunScale, mirror);
+		view.scale = game ? gunScale * 0.8f : gunScale;
+		view.restMuzzle = o;
+		view.restForward = d;
+		view.trigger = std::clamp(pull, 0.f, 1.f);
+		view.now = time * 1e-9;
+		view.sinceShot = sinceShot;
+		view.shot = g.shotCount;
+		view.player = g.player;
+		view.aimLine = config::VrLaser;
+		view.aimDot = config::VrLaser && (onScreen || aimOutside);
+		view.aimOutside = aimOutside && !onScreen;
+		view.aimPoint = o + d * (dist > 0.f ? dist * s : 5.f);
+		g.visible = config::VrShowGun;
+		if (game && slide)
+			updateOtherHand(time, 1 - g.hand, tracked[1 - g.hand], locations[1 - g.hand], pose * placement, gunScale, mirror);
 		else
 		{
-			gunView.otherHand = false;
-			gunView.slide = 0.f;
+			view.otherHand = false;
+			view.slide = 0.f;
+		}
+		// A gun in each hand leaves no hand for the slide: pointing a gun at the floor
+		// reloads it instead.
+		if (!slide)
+		{
+			if (!g.pointedDown && d.y < -0.75f)
+			{
+				g.pointedDown = true;
+				g.reloadAt = time;
+				haptic(g.hand, 0.02f, 0.5f);
+				NOTICE_LOG(INPUT, "XR: player %d pointed down (reload)", g.player + 1);
+			}
+			else if (g.pointedDown && d.y > -0.5f)
+				g.pointedDown = false;
 		}
 	}
 
@@ -1080,28 +1220,24 @@ void updateLightgun(XrTime time)
 	// without a break until it is let go, also while crossing the margin: the reload bit is
 	// A held too (maple_lightgun::transform_kcode), so no new press reaches the game and a
 	// held trigger never fires again by sweeping.
-	if (trigger && !triggerWas)
-		pullOutside = outside;
+	if (trigger && !g.triggerWas)
+		g.pullOutside = outside;
 	u32 buttons = 0;
-	if (trigger && !pullOutside)
+	if (trigger && !g.pullOutside)
 		// pointing away from the screen fires off-screen: that's how you reload
 		buttons |= onScreen ? 1 : 2;
 	// A shot at the 2D plane (menus, text, a flat screen): the game's own shot marker lands
 	// right where it hit, so it stays (vr::dropShotMarker).
 	if (trigger && onScreen && (!strcmp(aimHow, "2D") || !strcmp(aimHow, "menu") || !strcmp(aimHow, "screen")))
 		buttons |= 256;
-	// The gun's B: HOTD2 skips a story scene and backs out of menus with it.
-	if (boolAction(skipAction))
-		buttons |= 128;
-	if (boolAction(startAction))
-		buttons |= 4;
-	buttons |= dpad;
-	// A rack of the slide reloads: the trigger let go for a moment, then pulled off the
-	// screen. A trigger held through it waits to be let go, so it doesn't fire right after.
+	buttons |= extra;
+	// A reload (the slide racked, the gun pointed down): the trigger let go for a moment,
+	// then pulled off the screen. A trigger held through it waits to be let go, so it
+	// doesn't fire right after.
 	bool reloading = false;
-	if (reloadAt != 0)
+	if (g.reloadAt != 0)
 	{
-		const float since = (time - reloadAt) * 1e-9f;
+		const float since = (time - g.reloadAt) * 1e-9f;
 		if (since < 0.15f)
 		{
 			buttons &= ~3u;
@@ -1110,41 +1246,167 @@ void updateLightgun(XrTime time)
 				buttons |= 2;
 				reloading = true;
 			}
-			triggerWait = triggerWait || trigger;
+			g.triggerWait = g.triggerWait || trigger;
 		}
 		else
-			reloadAt = 0;
+			g.reloadAt = 0;
 	}
-	if (triggerWait && !trigger)
-		triggerWait = false;
-	if (triggerWait && reloadAt == 0)
+	if (g.triggerWait && !trigger)
+		g.triggerWait = false;
+	if (g.triggerWait && g.reloadAt == 0)
 		buttons &= ~3u;
 	// Trigger + B + Start is the game's own reset. A and B sit under one thumb: not by accident.
 	if ((buttons & 128) && (buttons & 3))
 		buttons &= ~4u;
-	if (trigger && !triggerWas && outside)
-		NOTICE_LOG(INPUT, "XR: trigger outside the game's view (no shot)");
-	else if (trigger && !triggerWas)
+	if (trigger && !g.triggerWas && outside)
+		NOTICE_LOG(INPUT, "XR: player %d's trigger outside the game's view (no shot)", g.player + 1);
+	else if (trigger && !g.triggerWas)
 	{
-		recoil();
+		recoil(g.hand);
 		lastShotScreen = onScreen ? glm::vec2(screen.x * 640.f, screen.y * 480.f) : glm::vec2(-1.f);
 		shotSerial++;
 		// diagnostics: where shots go, to compare with what the game makes of them
 		if (onScreen && !strcmp(aimHow, "3D"))
-			NOTICE_LOG(INPUT, "XR: shot at %d,%d (3D, %d cm) hit %s %u W %.1f/%.1f/%.1f at %.0f,%.0f %.0f,%.0f %.0f,%.0f tex %06x tsp %08x isp %08x col %02x%02x%02x%02x",
-					(int)(screen.x * 640.f), (int)(screen.y * 480.f), (int)(glm::length(gunView.aimPoint - gunView.restMuzzle) * 100.f),
+			NOTICE_LOG(INPUT, "XR: player %d shot at %d,%d (3D, %d cm) hit %s %u W %.1f/%.1f/%.1f at %.0f,%.0f %.0f,%.0f %.0f,%.0f tex %06x tsp %08x isp %08x col %02x%02x%02x%02x",
+					g.player + 1, (int)(screen.x * 640.f), (int)(screen.y * 480.f), (int)(glm::length(g.view.aimPoint - g.view.restMuzzle) * 100.f),
 					aimHit.list, aimHit.poly, aimHit.w[0], aimHit.w[1], aimHit.w[2], aimHit.xy[0].x, aimHit.xy[0].y,
 					aimHit.xy[1].x, aimHit.xy[1].y, aimHit.xy[2].x, aimHit.xy[2].y, aimHit.tex, aimHit.tsp, aimHit.isp,
 					aimHit.col[0], aimHit.col[1], aimHit.col[2], aimHit.col[3]);
 		else if (onScreen)
-			NOTICE_LOG(INPUT, "XR: shot at %d,%d (%s, %d cm)", (int)(screen.x * 640.f), (int)(screen.y * 480.f), aimHow,
-					(int)(glm::length(gunView.aimPoint - gunView.restMuzzle) * 100.f));
+			NOTICE_LOG(INPUT, "XR: player %d shot at %d,%d (%s, %d cm)", g.player + 1, (int)(screen.x * 640.f), (int)(screen.y * 480.f), aimHow,
+					(int)(glm::length(g.view.aimPoint - g.view.restMuzzle) * 100.f));
 		else
-			NOTICE_LOG(INPUT, "XR: shot off screen (reload)");
+			NOTICE_LOG(INPUT, "XR: player %d shot off screen (reload)", g.player + 1);
 	}
-	triggerWas = trigger;
+	g.triggerWas = trigger;
 	const glm::ivec2 pos = onScreen && !reloading ? glm::ivec2(screen * 10000.f) : glm::ivec2(OffScreen);
-	lightgunSet(0, pos.x, pos.y, buttons);
+	lightgunSet(g.player, pos.x, pos.y, buttons);
+}
+
+void updateLightgun(XrTime time)
+{
+	for (Gun& g : guns)
+		g.visible = false;
+	if (!config::VrXrGun)
+		return;
+	if (newGame.exchange(false))
+	{
+		if (dualWield)
+			lightgunSet(1, OffScreen, OffScreen, 0);
+		dualWield = false;
+		guns[1] = Gun { 1, Left };
+		guns[0].triggerWas = true;
+		slide.held = false;
+		leftStartWas = true;	// a left Start still held doesn't join at once
+	}
+	// The game runs itself to its game over scene for the agent's hands (hands_rip.h): its
+	// buttons are its own then.
+	const bool preparing = hands::preparing();
+	if (!focused)
+	{
+		// headset menu or app in the background: let go of everything
+		if (!preparing)
+			for (const Gun& g : guns)
+				lightgunSet(g.player, OffScreen, OffScreen, 0);
+		for (Gun& g : guns)
+			g.triggerWas = false;
+		return;
+	}
+	const XrActiveActionSet active { actionSet, XR_NULL_PATH };
+	XrActionsSyncInfo sync { XR_TYPE_ACTIONS_SYNC_INFO };
+	sync.countActiveActionSets = 1;
+	sync.activeActionSets = &active;
+	if (!XR_SUCCEEDED(xrSyncActions(session, &sync)))
+		return;
+	if (preparing)
+	{
+		// B (or Y): not now, the arcade gun this time
+		if (boolAction(skipAction))
+			hands::skipPrep();
+		for (Gun& g : guns)
+		{
+			// a trigger held through it doesn't fire when it's over: it waits to be let go
+			g.triggerWas = true;
+			g.triggerWait = true;
+		}
+		return;
+	}
+
+	const bool recenter = boolAction(recenterAction);
+	if (recenter && !recenterWas)
+		recenterRequested = true;
+	recenterWas = recenter;
+	const glm::vec2 stick = stickAction2();
+	const u32 dpad = adjustWorldSize(time, stick) ? dpadFromStick(glm::vec2(0.f)) : dpadFromStick(stick);
+
+	const XrSpaceLocationFlags valid = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+	XrSpaceLocation locations[2] { { XR_TYPE_SPACE_LOCATION }, { XR_TYPE_SPACE_LOCATION } };
+	bool tracked[2];
+	float pulls[2];
+	for (int hand : { Left, Right })
+	{
+		tracked[hand] = XR_SUCCEEDED(xrLocateSpace(aimSpaces[hand], localSpace, time, &locations[hand]))
+				&& (locations[hand].locationFlags & valid) == valid;
+		pulls[hand] = tracked[hand] ? floatAction(triggerAction, hand) : 0.f;
+	}
+	const bool leftStart = boolAction(startAction, Left);
+	const bool rightStart = boolAction(startAction, Right);
+	// Joining takes both controllers (with one, the left Start stays player 1's) and a game
+	// that shows when player 2 is out again (its profile knows the prompt).
+	const bool canJoin = config::VrDualWield && player2PromptKnown() && tracked[Left] && tracked[Right];
+	if (canJoin && leftStart && !leftStartWas && !dualWield)
+	{
+		dualWield = true;
+		dualSince = time;
+		guns[0].hand = Right;
+		guns[1] = Gun { 1, Left };
+		// a trigger already held doesn't fire: it waits to be let go
+		guns[1].triggerWas = true;
+		guns[1].triggerWait = true;
+		slide.held = false;
+		haptic(Left, 0.05f, 0.6f);
+		NOTICE_LOG(INPUT, "XR: player 2 joins: a gun in each hand");
+	}
+	leftStartWas = leftStart;
+	if (dualWield && (!config::VrDualWield || !player2PromptKnown()
+			|| ((time - dualSince) > 4'000'000'000LL && player2Prompting())))
+	{
+		dualWield = false;
+		lightgunSet(1, OffScreen, OffScreen, 0);
+		NOTICE_LOG(INPUT, "XR: player 2 is out: one gun again");
+	}
+	// Player 2 joins as at the cabinet: with the left controller's Start (vr.DualWield), and
+	// the left hand gets player 2's gun (above). Out again once the game asks for player 2 in
+	// its corner again (lost, or never got in), after a few seconds to let the join land.
+	Gun& gun = guns[0];
+	if (!dualWield)
+	{
+		// One gun: in the hand whose trigger is pulled while the gun hand's isn't, or the
+		// other one when the gun hand's controller is gone (asleep, battery).
+		const int otherHand = 1 - gun.hand;
+		if (!gun.triggerWas && ((tracked[otherHand] && !tracked[gun.hand]) || (pulls[otherHand] > 0.6f && pulls[gun.hand] < 0.35f)))
+		{
+			gun.hand = otherHand;
+			NOTICE_LOG(INPUT, "XR: the gun is in the %s hand", gun.hand == Right ? "right" : "left");
+		}
+	}
+
+	// The buttons that aren't the trigger. One gun: either Start is player 1's (unless the
+	// left one lets player 2 join), either B too (the gun's B: HOTD2 skips a story scene and
+	// backs out of menus with it). Two guns: each hand's are its player's. The D-pad (menus)
+	// is player 1's.
+	u32 p1 = dpad, p2 = 0;
+	if (dualWield)
+	{
+		p1 |= (rightStart ? 4 : 0) | (boolAction(skipAction, Right) ? 128 : 0);
+		p2 |= (leftStart ? 4 : 0) | (boolAction(skipAction, Left) ? 128 : 0);
+	}
+	else
+		p1 |= (rightStart || (leftStart && !canJoin) ? 4 : 0) | (boolAction(skipAction) ? 128 : 0);
+
+	updateGun(guns[0], time, locations, tracked, pulls, p1, !dualWield);
+	if (dualWield)
+		updateGun(guns[1], time, locations, tracked, pulls, p2, false);
 }
 
 // Left-eye image, every `step`th pixel, to a PPM file. Buffers are kept and the file goes
@@ -1271,18 +1533,21 @@ void captureIfRequested(GLuint fbo, int width, int height)
 	static std::string dir;
 	if (dir.empty())
 	{
-		// the app's internal files directory, from the game path we were started with
+		// the app's internal files directory, from the game path we were started with (when
+		// it's in there), else the data directory
 		const std::string& game = settings.content.path;
 		const size_t at = game.find("/files/");
-		dir = at == std::string::npos ? "/data/local/tmp" : game.substr(0, at + 6);
+		dir = at != std::string::npos ? game.substr(0, at + 6) : get_writable_data_path("");
+		if (!dir.empty() && (dir.back() == '/' || dir.back() == '\\'))
+			dir.pop_back();
 	}
 	static bool shotArmed;
 	static u32 armedSerial;
 	static int shotFrame = -1;
 	const std::string shotRequest = dir + "/capture-shot.request";
-	if (!shotArmed && shotFrame < 0 && access(shotRequest.c_str(), F_OK) == 0)
+	if (!shotArmed && shotFrame < 0 && file_exists(shotRequest))
 	{
-		unlink(shotRequest.c_str());
+		nowide::remove(shotRequest.c_str());
 		shotArmed = true;
 		armedSerial = shotSerial;
 		NOTICE_LOG(RENDERER, "XR: capturing at the next shot");
@@ -1305,9 +1570,9 @@ void captureIfRequested(GLuint fbo, int width, int height)
 		}
 	}
 	const std::string request = dir + "/capture.request";
-	if (access(request.c_str(), F_OK) != 0)
+	if (!file_exists(request))
 		return;
-	unlink(request.c_str());
+	nowide::remove(request.c_str());
 	if (!writeEye(fbo, width, height, dir + "/eye0.ppm", 1))
 		return;
 	NOTICE_LOG(RENDERER, "XR: captured the left eye to %s/eye0.ppm", dir.c_str());
@@ -1391,6 +1656,7 @@ void term()
 		NOTICE_LOG(RENDERER, "XR: render context going away, closing the session");
 		// still on the render thread with the context current: our own GL objects first
 		termGun();
+		termPanel();
 		for (EyeChain& c : chains)
 		{
 			if (!c.fbos.empty())
@@ -1401,9 +1667,10 @@ void term()
 		if (session != XR_NULL_HANDLE)
 			xrDestroySession(session);	// with its spaces and swapchains
 		xrDestroyInstance(instance);	// with the actions
-		// let go of the gun
+		// let go of the guns
 		if (config::VrXrGun)
-			lightgunSet(0, OffScreen, OffScreen, 0);
+			for (const Gun& g : guns)
+				lightgunSet(g.player, OffScreen, OffScreen, 0);
 	}
 	for (EyeChain& c : chains)
 		c = EyeChain();
@@ -1418,10 +1685,9 @@ void term()
 	sessionRunning = focused = drawingEye = false;
 	sessionLost = exiting = false;
 	originSet = recenterRequested = false;
-	triggerWas = recenterWas = false;
-	gunVisible = false;
-	lastShot = 0;
-	shotCount = 0;
+	guns[0] = Gun { 0 };
+	guns[1] = Gun { 1, Left };
+	dualWield = leftStartWas = recenterWas = false;
 	initTried = false;
 }
 
@@ -1430,6 +1696,8 @@ bool frame()
 	if (!initTried && !init())
 	{
 		ERROR_LOG(RENDERER, "XR: initialisation failed, showing the flat window instead");
+		// no headset: no panel to show the run for the agent's hands on either
+		hands::skipPrep();
 		return rend_single_frame(true);
 	}
 	if (session != XR_NULL_HANDLE)
@@ -1465,8 +1733,46 @@ bool frame()
 		return false;
 	}
 
-	// Let through whatever the emulator produced since the last headset frame.
-	rend_vr_drain(0);
+	// Let through whatever the emulator produced since the last headset frame. While it runs
+	// the game to its game over scene for the agent's hands (hands_rip.h), it goes as fast as
+	// it can: it waits for each of its frames to be taken, so keep taking them for most of
+	// the headset's frame.
+	const bool preparing = hands::preparing();
+	if (preparing)
+	{
+		const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(9);
+		while (std::chrono::steady_clock::now() < until && hands::preparing())
+			rend_vr_drain(1);
+	}
+	else
+		rend_vr_drain(0);
+	// What the panel says: while that runs, and for a moment when it's done.
+	static bool wasPreparing;
+	static std::chrono::steady_clock::time_point doneUntil;
+	if (wasPreparing && !preparing && hands::prepProgress() >= 1.f)
+		doneUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+	wasPreparing = preparing;
+	Panel panel;
+	const glm::vec3 red(0.86f, 0.13f, 0.1f), white(0.92f), grey(0.66f);
+	if (preparing)
+	{
+		panel.lines = {
+			{ "THE HOUSE OF THE DEAD 2 VR", 0.085f, red },
+			{ "", 0.03f, white },
+			{ "Taking the agent's hands and pistol from your game", 0.064f, white },
+			{ "Only this once: the game plays itself to its game over, fast.", 0.047f, grey },
+		};
+		panel.progress = hands::prepProgress();
+		panel.footer = "B: skip it for now (the arcade gun this time)";
+	}
+	else if (std::chrono::steady_clock::now() < doneUntil)
+		panel.lines = {
+			{ "THE HOUSE OF THE DEAD 2 VR", 0.085f, red },
+			{ "", 0.03f, white },
+			{ "Got them. The agent's hands are yours.", 0.064f, white },
+			{ "Reload: grab the back of the pistol with your other hand and pull.", 0.047f, grey },
+		};
+	const bool showPanel = !panel.lines.empty();
 
 	XrViewState viewState { XR_TYPE_VIEW_STATE };
 	XrViewLocateInfo locateInfo { XR_TYPE_VIEW_LOCATE_INFO };
@@ -1498,7 +1804,17 @@ bool frame()
 		const glm::mat4 view = glm::inverse(glm::translate(glm::mat4(1.f), relativePosition(views[i].pose.position))
 				* glm::mat4_cast(relativeRotation(views[i].pose.orientation)));
 		eye = { c.fbos[index], c.width, c.height, eyeProjection(views[i].fov) * view * gameToWorld() };
-		if (gles_vr_have_frame())
+		if (showPanel)
+		{
+			// a dark room with the panel in it
+			glBindFramebuffer(GL_FRAMEBUFFER, c.fbos[index]);
+			glViewport(0, 0, c.width, c.height);
+			glcache.Disable(GL_SCISSOR_TEST);
+			glcache.ClearColor(0.02f, 0.02f, 0.025f, 1.f);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+			drawPanel(eyeProjection(views[i].fov) * view, panel);
+		}
+		else if (gles_vr_have_frame())
 		{
 			drawingEye = true;
 			gles_vr_draw_eye(c.width, c.height);
@@ -1513,11 +1829,27 @@ bool frame()
 			glcache.ClearColor(0.f, 0.f, 0.f, 1.f);
 			glClear(GL_COLOR_BUFFER_BIT);
 		}
-		if (gunVisible)
+		if (!showPanel && (guns[0].visible || guns[1].visible))
 		{
+			// every gun's model, then every gun's glow (dots and flashes over both models)
 			glBindFramebuffer(GL_FRAMEBUFFER, c.fbos[index]);
 			glViewport(0, 0, c.width, c.height);
-			drawGun(eyeProjection(views[i].fov) * view, relativePosition(views[i].pose.position), gunView);
+			const glm::mat4 viewProj = eyeProjection(views[i].fov) * view;
+			const glm::vec3 eyePos = relativePosition(views[i].pose.position);
+			bool first = true;
+			for (const Gun& g : guns)
+				if (g.visible)
+				{
+					drawGunModel(viewProj, eyePos, g.view, first);
+					first = false;
+				}
+			first = true;
+			for (const Gun& g : guns)
+				if (g.visible)
+				{
+					drawGunGlow(viewProj, eyePos, g.view, first);
+					first = false;
+				}
 		}
 		if (i == 0)
 			captureIfRequested(c.fbos[index], c.width, c.height);
