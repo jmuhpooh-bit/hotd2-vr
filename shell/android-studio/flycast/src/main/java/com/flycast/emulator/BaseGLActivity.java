@@ -253,11 +253,13 @@ public abstract class BaseGLActivity extends Activity implements ActivityCompat.
         super.onDestroy();
         paused = true;
         InputDeviceManager.getInstance().stopListening();
+        // The render thread must release its OpenXR session while the JNI
+        // Activity reference and audio backend are still alive.
+        stopEmulator();
         register(null);
         if (audioBackend != null)
             audioBackend.release();
         Emulator.setCurrentActivity(null);
-        stopEmulator();
     }
 
     @Override

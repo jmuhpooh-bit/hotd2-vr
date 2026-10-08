@@ -59,6 +59,12 @@ SwappyGLGC::~SwappyGLGC() {
 
 void SwappyGLGC::activate(bool enable)
 {
+#ifdef USE_OPENXR
+	// OpenXR paces the eye swapchains. Swappy must not retain the Android window
+	// which the Quest removes when transitioning into immersive mode.
+	if (config::VrXr)
+		enable = false;
+#endif
 	if (this->enabled == enable)
 		return;
 	this->enabled = enable;

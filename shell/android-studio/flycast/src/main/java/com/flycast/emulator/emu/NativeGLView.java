@@ -22,6 +22,7 @@ import com.flycast.emulator.periph.InputDeviceManager;
 
 public class NativeGLView extends SurfaceView implements SurfaceHolder.Callback {
     private boolean surfaceReady = false;
+    private boolean vrRenderStarted = false;
     private boolean paused = false;
     private TouchEventHandler vjoyDelegate = null;
 
@@ -110,6 +111,7 @@ public class NativeGLView extends SurfaceView implements SurfaceHolder.Callback 
         Log.i("flycast", "NativeGLView.surfaceChanged: " + w + "x" + h);
         surfaceReady = true;
         JNIdc.rendinitNative(surfaceHolder.getSurface(), w, h);
+        vrRenderStarted = getContext().getPackageName().endsWith(".vr");
         BaseGLActivity activity = Emulator.getCurrentActivity();
         if (activity != null)
             activity.handleStateChange(false);
@@ -119,6 +121,12 @@ public class NativeGLView extends SurfaceView implements SurfaceHolder.Callback 
     public void surfaceDestroyed(SurfaceHolder surfaceHolder) {
         Log.i("flycast", "NativeGLView.surfaceDestroyed");
         surfaceReady = false;
+        if (vrRenderStarted) {
+            // OpenXR owns a persistent offscreen GL context. The Android window
+            // disappearing is not a request to stop VR or pause the game.
+            JNIdc.rendinitNative(null, 0, 0);
+            return;
+        }
         BaseGLActivity activity = Emulator.getCurrentActivity();
         if (activity != null)
             activity.handleStateChange(true);
@@ -128,7 +136,7 @@ public class NativeGLView extends SurfaceView implements SurfaceHolder.Callback 
     }
 
     public boolean isSurfaceReady() {
-        return surfaceReady;
+        return surfaceReady || vrRenderStarted;
     }
 
     public void pause() {

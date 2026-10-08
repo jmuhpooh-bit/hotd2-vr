@@ -19,6 +19,7 @@
     You should have received a copy of the GNU General Public License
     along with Flycast.  If not, see <https://www.gnu.org/licenses/>.
 */
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include "egl.h"
@@ -85,10 +86,16 @@ bool EGLGraphicsContext::init()
 
 	gladLoaderLoadEGL(display);
 
+#if defined(__ANDROID__) && defined(USE_OPENXR)
+	const bool immersive = config::VrXr;
+#else
+	const bool immersive = false;
+#endif
+
 	if (surface == EGL_NO_SURFACE)
 	{
 		EGLint pi32ConfigAttribs[]  = {
-				EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+				EGL_SURFACE_TYPE, immersive ? EGL_PBUFFER_BIT : EGL_WINDOW_BIT,
 				EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
 				EGL_RED_SIZE, 8,
 				EGL_GREEN_SIZE, 8,
@@ -105,19 +112,35 @@ bool EGLGraphicsContext::init()
 			return false;
 		}
 #ifdef __ANDROID__
-		EGLint format;
-		if (!eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &format))
+		if (!immersive)
 		{
-			ERROR_LOG(RENDERER, "eglGetConfigAttrib() returned error %x", eglGetError());
-			return false;
+			EGLint format;
+			if (!eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &format))
+			{
+				ERROR_LOG(RENDERER, "eglGetConfigAttrib() returned error %x", eglGetError());
+				return false;
+			}
+			ANativeWindow_setBuffersGeometry((ANativeWindow *)window, 0, 0, format);
 		}
-		ANativeWindow_setBuffersGeometry((ANativeWindow *)window, 0, 0, format);
 #endif
-		surface = eglCreateWindowSurface(display, config, (EGLNativeWindowType)window, nullptr);
+		if (immersive)
+		{
+			// The Quest can remove the Android SurfaceView while entering VR or
+			// showing its system menu. Eye swapchains need a GL context, not that
+			// window: keep it current on a private offscreen surface instead.
+			const EGLint pbufferAttrs[] = {
+				EGL_WIDTH, std::max(1, settings.display.width),
+				EGL_HEIGHT, std::max(1, settings.display.height), EGL_NONE
+			};
+			surface = eglCreatePbufferSurface(display, config, pbufferAttrs);
+			NOTICE_LOG(RENDERER, "XR: creating an offscreen EGL surface independent of the Android window");
+		}
+		else
+			surface = eglCreateWindowSurface(display, config, (EGLNativeWindowType)window, nullptr);
 
 		if (surface == EGL_NO_SURFACE)
 		{
-			ERROR_LOG(RENDERER, "EGL Error: eglCreateWindowSurface failed: %x", eglGetError());
+			ERROR_LOG(RENDERER, "EGL Error: creating %s surface failed: %x", immersive ? "pbuffer" : "window", eglGetError());
 			return false;
 		}
 

@@ -269,6 +269,8 @@ static void *savestateThreadFunc(void *)
 
 static cThread savestateThread(savestateThreadFunc, nullptr, "Flycast-save");
 
+static void stopRenderThread();
+
 extern "C" JNIEXPORT void JNICALL Java_com_flycast_emulator_emu_JNIdc_pause(JNIEnv *env,jobject obj)
 {
 	if (config::GGPOEnable)
@@ -302,6 +304,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_flycast_emulator_emu_JNIdc_stop(JNIEn
 {
 	stopEmu();
 	savestateThread.WaitToEnd();
+#ifdef USE_OPENXR
+	if (config::VrXr)
+		stopRenderThread();
+#endif
 	gui_stop_game();
 	input_term();
 }
@@ -329,24 +335,43 @@ static void *render_thread_func(void *)
 
 static cThread render_thread(render_thread_func, nullptr, "Flycast-rend");
 
+static void stopRenderThread()
+{
+	if (render_thread.thread.joinable())
+	{
+		mainui_stop();
+		render_thread.WaitToEnd();
+	}
+}
+
 extern "C" JNIEXPORT void JNICALL Java_com_flycast_emulator_emu_JNIdc_rendinitNative(JNIEnv * env, jobject obj, jobject surface, jint width, jint height)
 {
+#ifdef USE_OPENXR
+	const bool immersive = config::VrXr;
+#else
+	const bool immersive = false;
+#endif
 	if (render_thread.thread.joinable())
 	{
 		if (surface == nullptr)
 		{
-			mainui_stop();
-	        render_thread.WaitToEnd();
+			if (immersive)
+				NOTICE_LOG(RENDERER, "XR: Android surface hidden; keeping the offscreen render thread alive");
+			else
+				stopRenderThread();
 		}
 		else
 		{
 			settings.display.width = width;
 			settings.display.height = height;
-		    mainui_reinit();
+			if (!immersive)
+				mainui_reinit();
 		}
 	}
 	else if (surface != nullptr)
 	{
+        settings.display.width = width;
+        settings.display.height = height;
         g_window = ANativeWindow_fromSurface(env, surface);
         mainui_start();
         render_thread.Start();
