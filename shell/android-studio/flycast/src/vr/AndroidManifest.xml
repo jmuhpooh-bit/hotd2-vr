@@ -38,7 +38,16 @@
              process-wide emulator, render thread and OpenXR session. -->
         <activity
             android:name="com.flycast.emulator.NativeGLActivity"
-            android:launchMode="singleTask" />
+            android:launchMode="singleTask">
+            <!-- Horizon resolves the launcher alias to this component before
+                 deciding whether it is immersive. Mark the target as VR too. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity>
 
         <!-- launch in VR; also openable with a game file, as the regular app -->
         <activity-alias
